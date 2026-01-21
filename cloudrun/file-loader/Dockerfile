@@ -24,6 +24,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime stage - use distroless for minimal attack surface
 FROM gcr.io/distroless/cc-debian13
 
+# Copy required shared libraries not in distroless
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libbz2.so.1.0 /usr/lib/x86_64-linux-gnu/libbz2.so.1.0
+
 # Copy the built binary
 COPY --from=builder /file-loader-cloudrun /file-loader-cloudrun
 
