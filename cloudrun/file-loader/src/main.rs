@@ -108,7 +108,6 @@ async fn poll_and_process(
 
     // Load current state
     let mut state = load_state(state_file_uri).await?;
-    let initial_count = state.processed_files.len();
 
     // List all objects with the prefix
     let list_prefix = if prefix.is_empty() {
@@ -142,7 +141,10 @@ async fn poll_and_process(
     let mut table = oxbow::lock::open_table(delta_table_uri).await?;
     let arrow_schema = table.snapshot()?.snapshot().arrow_schema();
 
-    // Process each new file
+    // Process each new file, saving state every 100 files
+    const SAVE_INTERVAL: usize = 100;
+    let mut files_since_save = 0;
+
     for obj in new_files {
         let file_path = obj.location.as_ref();
         let file_uri = format!("gs://{}/{}", bucket, file_path);
@@ -168,6 +170,17 @@ async fn poll_and_process(
                     records, file_path
                 );
                 state.processed_files.insert(file_path.to_string());
+                files_since_save += 1;
+
+                // Save state periodically to avoid losing progress
+                if files_since_save >= SAVE_INTERVAL {
+                    save_state(state_file_uri, &state).await?;
+                    info!(
+                        "Checkpoint: saved state with {} total processed files",
+                        state.processed_files.len()
+                    );
+                    files_since_save = 0;
+                }
             }
             Err(e) => {
                 error!("Failed to process {}: {:?}", file_path, e);
@@ -176,8 +189,8 @@ async fn poll_and_process(
         }
     }
 
-    // Save state if we processed any files
-    if state.processed_files.len() > initial_count {
+    // Save final state if we have unsaved progress
+    if files_since_save > 0 {
         save_state(state_file_uri, &state).await?;
         info!(
             "Updated state file with {} total processed files",
