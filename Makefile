@@ -25,3 +25,23 @@ test: ## Run the crate's tests with each set of features
 
 clean: ## Clean up resources from build
 	cargo clean
+
+REGISTRY ?= asia-northeast1-docker.pkg.dev/data-dev-596660/oxbow
+
+.PHONY: docker-build-file-loader docker-push-file-loader
+docker-build-file-loader: ## Build file-loader Docker image for linux/amd64
+	docker buildx build \
+		--platform linux/amd64 \
+		-t $(REGISTRY)/file-loader:latest \
+		-f cloudrun/file-loader/Dockerfile \
+		.
+
+docker-push-file-loader: ## Build and push file-loader Docker image with registry cache
+	docker buildx build \
+		--platform linux/amd64 \
+		-t $(REGISTRY)/file-loader:latest \
+		-f cloudrun/file-loader/Dockerfile \
+		--cache-from type=registry,ref=$(REGISTRY)/file-loader:cache \
+		--cache-to type=registry,ref=$(REGISTRY)/file-loader:cache,mode=max \
+		--push \
+		.
