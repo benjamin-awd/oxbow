@@ -46,3 +46,8 @@ opt-level = "z"
 inherits = "release"
 lto = "thin"
 
+# Patch object_store to fall back to x-goog-stored-content-length header for GCS
+# when Content-Length is missing (GCS uses chunked transfer encoding)
+[patch.crates-io]
+object_store = { git = "https://github.com/benjamin-awd/arrow-rs-object-store", branch = "0.12.5/gcs-content-length" }
+
