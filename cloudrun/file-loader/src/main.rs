@@ -19,13 +19,12 @@ use axum::{Router, routing::get};
 use deltalake::ObjectStore;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::json::reader::{Decoder, ReaderBuilder};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use tokio_util::io::StreamReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::log::*;
 use url::Url;
 
@@ -91,7 +90,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 }
 
-/// Poll for new files and process them
+/// Poll for new files and process them in batches
 async fn poll_and_process(
     bucket: &str,
     prefix: &str,
@@ -99,6 +98,8 @@ async fn poll_and_process(
     state_file_uri: &str,
 ) -> Result<(), anyhow::Error> {
     use deltalake::logstore::{StorageConfig, logstore_for};
+
+    const BATCH_SIZE: usize = 100; // Process 100 files per batch
 
     debug!("Polling gs://{}/{} for new files", bucket, prefix);
 
@@ -110,62 +111,126 @@ async fn poll_and_process(
     // Load current state
     let mut state = load_state(state_file_uri).await?;
 
-    // List all objects with the prefix
+    // List objects with prefix, filtering as we go
     let list_prefix = if prefix.is_empty() {
         None
     } else {
         Some(deltalake::Path::from(prefix))
     };
 
-    let objects: Vec<_> = object_store
-        .list(list_prefix.as_ref())
-        .try_collect()
-        .await?;
+    // Stream the listing and filter to new files only
+    let mut listing = object_store.list(list_prefix.as_ref());
+    let mut new_files = Vec::with_capacity(BATCH_SIZE);
+    let mut total_listed = 0usize;
+    let mut total_processed = 0usize;
 
-    // Filter to supported files that haven't been processed
-    let new_files: Vec<_> = objects
-        .into_iter()
-        .filter(|obj| {
-            let name = obj.location.as_ref();
-            is_supported_json_file(name) && !state.processed_files.contains(name)
-        })
-        .collect();
-
-    if new_files.is_empty() {
-        debug!("No new files to process");
-        return Ok(());
-    }
-
-    info!("Found {} new files to process", new_files.len());
-
-    // Open the Delta table once for all files
+    // Open the Delta table once
     let mut table = oxbow::lock::open_table(delta_table_uri).await?;
     let arrow_schema = table.snapshot()?.snapshot().arrow_schema();
 
-    // Process files concurrently based on available CPU cores
     let concurrency = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    info!("Processing files with concurrency: {}", concurrency);
 
+    // Stream through listing and process in batches
+    while let Some(result) = listing.next().await {
+        let obj = result?;
+        total_listed += 1;
+
+        let name = obj.location.as_ref();
+        if is_supported_json_file(name) && !state.processed_files.contains(name) {
+            new_files.push(obj);
+        }
+
+        // Process batch when full
+        if new_files.len() >= BATCH_SIZE {
+            let batch_num = total_processed / BATCH_SIZE + 1;
+            info!(
+                "Processing batch {} ({} files, {} listed so far)",
+                batch_num,
+                new_files.len(),
+                total_listed
+            );
+
+            let processed = process_file_batch(
+                &new_files,
+                &object_store,
+                &arrow_schema,
+                bucket,
+                &mut table,
+                &mut state,
+                concurrency,
+            )
+            .await?;
+
+            total_processed += processed;
+            save_state(state_file_uri, &state).await?;
+            new_files.clear();
+        }
+    }
+
+    // Process remaining files
+    if !new_files.is_empty() {
+        info!(
+            "Processing final batch ({} files, {} total listed)",
+            new_files.len(),
+            total_listed
+        );
+
+        let processed = process_file_batch(
+            &new_files,
+            &object_store,
+            &arrow_schema,
+            bucket,
+            &mut table,
+            &mut state,
+            concurrency,
+        )
+        .await?;
+
+        total_processed += processed;
+        save_state(state_file_uri, &state).await?;
+    }
+
+    if total_processed > 0 {
+        info!(
+            "Completed: processed {} files out of {} listed",
+            total_processed, total_listed
+        );
+    } else {
+        debug!("No new files to process ({} listed)", total_listed);
+    }
+
+    Ok(())
+}
+
+/// Process a batch of files concurrently
+async fn process_file_batch(
+    files: &[deltalake::ObjectMeta],
+    object_store: &Arc<dyn ObjectStore>,
+    arrow_schema: &Arc<deltalake::arrow::datatypes::Schema>,
+    _bucket: &str,
+    table: &mut deltalake::DeltaTable,
+    state: &mut ProcessedState,
+    concurrency: usize,
+) -> Result<usize, anyhow::Error> {
     // Read and parse files concurrently
-    let results: Vec<_> = futures::stream::iter(new_files)
+    let results: Vec<_> = futures::stream::iter(files)
         .map(|obj| {
             let store = object_store.clone();
             let schema = arrow_schema.clone();
-            let bucket = bucket.to_string();
+            let location = obj.location.clone();
+            let size = obj.size;
             async move {
-                let file_path = obj.location.as_ref().to_string();
-                let file_uri = format!("gs://{}/{}", bucket, file_path);
+                let file_path = location.as_ref().to_string();
                 let is_compressed = is_gzip_compressed(&file_path);
 
-                info!(
+                debug!(
                     "Processing: {} ({} bytes, compressed: {})",
-                    file_uri, obj.size, is_compressed
+                    file_path, size, is_compressed
                 );
 
-                let result =
-                    read_and_parse_file(&store, &obj.location, schema, is_compressed).await;
+                let result = read_and_parse_file(&store, &location, schema, is_compressed).await;
                 (file_path, result)
             }
         })
@@ -180,7 +245,7 @@ async fn poll_and_process(
     for (file_path, result) in results {
         match result {
             Ok((batches, records)) => {
-                info!("Successfully parsed {} records from {}", records, file_path);
+                info!("Parsed {} records from {}", records, file_path);
                 all_batches.extend(batches);
                 processed_paths.push(file_path);
             }
@@ -191,68 +256,55 @@ async fn poll_and_process(
     }
 
     // Write all batches to Delta table in one commit
+    let files_processed = processed_paths.len();
     if !all_batches.is_empty() {
         let total_records: usize = all_batches.iter().map(|b| b.num_rows()).sum();
-        let version = write_batches_to_table(all_batches, &mut table).await?;
+        let version = write_batches_to_table(all_batches, table).await?;
         info!(
-            "Wrote {} records from {} files to Delta table version {}",
-            total_records,
-            processed_paths.len(),
-            version
+            "Wrote {} records from {} files to Delta table v{}",
+            total_records, files_processed, version
         );
 
-        // Update state with all processed files
+        // Update state with processed files
         for path in processed_paths {
             state.processed_files.insert(path);
         }
-        save_state(state_file_uri, &state).await?;
-        info!(
-            "Updated state file with {} total processed files",
-            state.processed_files.len()
-        );
     }
 
-    Ok(())
+    Ok(files_processed)
 }
 
-/// Read and parse a single file using streaming, returning record batches
+/// Read and parse a single file using streaming decompression and JSON parsing
 async fn read_and_parse_file(
     store: &Arc<dyn ObjectStore>,
     path: &deltalake::Path,
     arrow_schema: Arc<deltalake::arrow::datatypes::Schema>,
     is_compressed: bool,
 ) -> Result<(Vec<RecordBatch>, usize), anyhow::Error> {
-    // Stream from ObjectStore instead of loading all bytes
-    let get_result = store.get(path).await?;
-    let byte_stream = get_result
-        .into_stream()
-        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let async_read = StreamReader::new(byte_stream);
-
-    // Wrap in BufReader, with async decompression if needed
-    let buffered: Box<dyn AsyncBufRead + Unpin + Send> = if is_compressed {
-        debug!("Streaming with gzip decompression: {}", path);
-        Box::new(BufReader::new(GzipDecoder::new(BufReader::new(async_read))))
-    } else {
-        debug!("Streaming without compression: {}", path);
-        Box::new(BufReader::new(async_read))
-    };
+    // Load compressed file content into memory (small, ~1MB)
+    let data_bytes = store.get(path).await?.bytes().await?;
 
     // Create incremental JSON decoder
     let mut decoder = ReaderBuilder::new(arrow_schema)
         .with_batch_size(10_000)
         .build_decoder()?;
 
-    // Stream and decode
-    let batches = deserialize_stream(buffered, &mut decoder).await?;
-    let total_records: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // Stream decompress and parse
+    let batches = if is_compressed {
+        let reader = BufReader::new(GzipDecoder::new(BufReader::new(&data_bytes[..])));
+        deserialize_stream(reader, &mut decoder).await?
+    } else {
+        let reader = BufReader::new(&data_bytes[..]);
+        deserialize_stream(reader, &mut decoder).await?
+    };
 
+    let total_records: usize = batches.iter().map(|b| b.num_rows()).sum();
     Ok((batches, total_records))
 }
 
 /// Deserialize bytes from an async reader into RecordBatches
 async fn deserialize_stream(
-    mut reader: impl AsyncBufRead + Unpin,
+    mut reader: impl tokio::io::AsyncBufRead + Unpin,
     decoder: &mut Decoder,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let mut batches = Vec::new();
@@ -270,13 +322,28 @@ async fn deserialize_stream(
             break;
         }
 
-        let have_read = decoder.decode(buf)?;
+        let mut have_read = decoder.decode(buf)?;
+
+        // If decoder couldn't make progress, flush to free internal buffer space
+        if have_read == 0 && !buf.is_empty() {
+            if let Some(batch) = decoder.flush()? {
+                batches.push(batch);
+            }
+            // Try decode again after flush
+            have_read = decoder.decode(buf)?;
+            if have_read == 0 {
+                // Still can't progress - skip one byte to avoid infinite loop
+                warn!("Decoder stuck, skipping byte");
+                reader.consume(1);
+                continue;
+            }
+        }
+
         reader.consume(have_read);
 
         // Flush when decoder has complete records
         if !decoder.has_partial_record() {
             if let Some(batch) = decoder.flush()? {
-                debug!("Decoded batch with {} rows", batch.num_rows());
                 batches.push(batch);
             }
         }
