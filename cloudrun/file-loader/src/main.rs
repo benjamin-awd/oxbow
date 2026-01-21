@@ -16,9 +16,13 @@
 ///
 use async_compression::tokio::bufread::GzipDecoder;
 use axum::{Router, routing::get};
+use deltalake::ObjectMeta;
 use deltalake::ObjectStore;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::json::reader::{Decoder, ReaderBuilder};
+use deltalake::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use deltalake::parquet::basic::Compression;
+use deltalake::parquet::file::properties::WriterProperties;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -27,6 +31,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::log::*;
 use url::Url;
+use uuid::Uuid;
 
 /// State file tracking which files have been processed
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -255,15 +260,36 @@ async fn process_file_batch(
         }
     }
 
-    // Write all batches to Delta table in one commit
+    // Write parquet file directly to table storage and commit to Delta
     let files_processed = processed_paths.len();
     if !all_batches.is_empty() {
         let total_records: usize = all_batches.iter().map(|b| b.num_rows()).sum();
-        let version = write_batches_to_table(all_batches, table).await?;
+
+        // Phase 2: Write parquet file directly to table storage
+        let table_store = table.object_store();
+        let written_file = write_parquet_file(
+            all_batches,
+            table_store,
+            arrow_schema.clone(),
+        )
+        .await?;
+
         info!(
-            "Wrote {} records from {} files to Delta table v{}",
+            "Wrote parquet file {} ({} bytes)",
+            written_file.location, written_file.size
+        );
+
+        // Phase 3: Commit to Delta using oxbow's CommitBuilder wrapper
+        let actions = oxbow::add_actions_for(&[written_file]);
+        let version = oxbow::commit_to_table(&actions, table).await?;
+
+        info!(
+            "Committed {} records from {} files to Delta table v{}",
             total_records, files_processed, version
         );
+
+        // Reload table state for next batch
+        table.load().await?;
 
         // Update state with processed files
         for path in processed_paths {
@@ -408,23 +434,43 @@ fn is_gzip_compressed(name: &str) -> bool {
     name.to_lowercase().ends_with(".gz")
 }
 
-/// Write RecordBatches to the given DeltaTable and return the new version
-async fn write_batches_to_table(
+/// Write record batches to a parquet file and return its metadata
+async fn write_parquet_file(
     batches: Vec<RecordBatch>,
-    table: &mut deltalake::DeltaTable,
-) -> Result<i64, anyhow::Error> {
-    use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
+    object_store: Arc<dyn ObjectStore>,
+    schema: Arc<deltalake::arrow::datatypes::Schema>,
+) -> Result<ObjectMeta, anyhow::Error> {
+    // Generate unique filename
+    let uuid = Uuid::new_v4();
+    let filename = format!("part-{}.snappy.parquet", uuid);
+    let path = deltalake::Path::from(filename);
 
-    let mut writer = RecordBatchWriter::for_table(table)?;
+    // Create parquet writer with snappy compression
+    let sink = ParquetObjectWriter::new(object_store.clone(), path.clone());
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
 
-    for batch in batches {
+    let mut writer = AsyncArrowWriter::try_new(sink, schema, Some(props))?;
+
+    // Write all batches
+    for batch in &batches {
         writer.write(batch).await?;
     }
+    writer.close().await?;
 
-    let version = writer.flush_and_commit(table).await?;
-    debug!("Successfully wrote v{version} to Delta table");
-    Ok(version)
+    // Get file metadata from object store
+    let meta = object_store.head(&path).await?;
+
+    Ok(ObjectMeta {
+        location: path,
+        last_modified: meta.last_modified,
+        size: meta.size,
+        e_tag: meta.e_tag,
+        version: meta.version,
+    })
 }
+
 
 #[cfg(test)]
 mod tests {
