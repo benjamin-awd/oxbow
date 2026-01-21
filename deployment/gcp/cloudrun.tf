@@ -9,6 +9,8 @@ resource "google_cloud_run_v2_service" "file_loader" {
 
   labels = local.common_labels
 
+  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
   template {
     service_account = google_service_account.oxbow_runtime.email
 
@@ -25,7 +27,7 @@ resource "google_cloud_run_v2_service" "file_loader" {
 
       resources {
         limits = {
-          cpu    = "1"
+          cpu    = "1000m"
           memory = "2Gi"
         }
         # CPU always allocated since this is a polling service
