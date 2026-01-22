@@ -10,9 +10,6 @@ use tokio_util::io::StreamReader;
 
 use crate::schema::infer_schema_from_json_sample;
 
-/// Stream and parse a file from GCS with lazy reading
-/// - Uses object_store's streaming API (bytes fetched on demand)
-/// - Uses configurable batch size for accumulating records
 pub async fn stream_and_parse_file(
     store: &Arc<dyn ObjectStore>,
     path: &deltalake::Path,
@@ -20,21 +17,17 @@ pub async fn stream_and_parse_file(
     is_compressed: bool,
     batch_size: usize,
 ) -> Result<(Vec<RecordBatch>, usize), anyhow::Error> {
-    // Get file as a stream of bytes
     let get_result = store.get(path).await?;
 
-    // Convert to a stream of bytes, then to AsyncRead
     let byte_stream = get_result
         .into_stream()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
     let stream_reader = StreamReader::new(byte_stream);
 
-    // Create incremental JSON decoder with configurable batch size
     let mut decoder = ReaderBuilder::new(arrow_schema)
         .with_batch_size(batch_size)
         .build_decoder()?;
 
-    // Stream decompress and parse
     let batches = if is_compressed {
         let buf_reader = BufReader::new(GzipDecoder::new(BufReader::new(stream_reader)));
         deserialize_stream(buf_reader, &mut decoder).await?
@@ -57,14 +50,12 @@ pub async fn sample_schema_from_file(
     is_compressed: bool,
     sample_bytes: usize,
 ) -> Result<ArrowSchema, anyhow::Error> {
-    // Get file as a stream of bytes
     let get_result = store.get(path).await?;
     let byte_stream = get_result
         .into_stream()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
     let stream_reader = StreamReader::new(byte_stream);
 
-    // Read only the first sample_bytes
     let sample = if is_compressed {
         let mut buf_reader = BufReader::new(GzipDecoder::new(BufReader::new(stream_reader)));
         let mut decompressed = vec![0u8; sample_bytes];
@@ -82,7 +73,6 @@ pub async fn sample_schema_from_file(
     infer_schema_from_json_sample(&sample)
 }
 
-/// Deserialize bytes from an async reader into RecordBatches
 async fn deserialize_stream(
     mut reader: impl tokio::io::AsyncBufRead + Unpin,
     decoder: &mut Decoder,
@@ -137,12 +127,10 @@ async fn deserialize_stream(
     Ok(batches)
 }
 
-/// Case-insensitive check if string ends with suffix
 fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
     s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// Check if a filename is a supported JSON file format
 pub fn is_supported_json_file(name: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
         ".json",
@@ -157,7 +145,6 @@ pub fn is_supported_json_file(name: &str) -> bool {
         .any(|ext| ends_with_ignore_case(name, ext))
 }
 
-/// Check if a file is gzip compressed based on extension
 pub fn is_gzip_compressed(name: &str) -> bool {
     ends_with_ignore_case(name, ".gz")
 }

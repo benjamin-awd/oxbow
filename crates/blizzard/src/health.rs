@@ -12,8 +12,6 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// Create a new heartbeat tracker.
-    ///
     /// `max_age_secs` is the maximum time since the last heartbeat before
     /// the service is considered unhealthy.
     pub fn new(max_age_secs: u64) -> Self {
@@ -23,13 +21,11 @@ impl Heartbeat {
         }
     }
 
-    /// Update the heartbeat to the current time.
     pub fn touch(&self) {
         self.last_update
             .store(current_timestamp(), Ordering::Relaxed);
     }
 
-    /// Check if the heartbeat is stale.
     /// Returns `Ok(())` if healthy, or `Err(age_secs)` if stale.
     pub fn check(&self) -> Result<(), u64> {
         let last = self.last_update.load(Ordering::Relaxed);
@@ -51,11 +47,8 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Spawn the health check HTTP server.
-///
-/// The server runs on the specified address and exposes a `/health` endpoint
-/// that returns 200 OK if the heartbeat is fresh, or 503 Service Unavailable
-/// if the main loop appears to be stale/stuck.
+/// Exposes a `/health` endpoint that returns 200 OK if the heartbeat is fresh,
+/// or 503 Service Unavailable if the main loop appears to be stale/stuck.
 pub fn spawn_health_server(addr: String, heartbeat: Heartbeat) {
     tokio::spawn(async move {
         let app = Router::new().route(

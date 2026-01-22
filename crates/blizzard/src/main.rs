@@ -51,7 +51,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Starting file-loader polling service");
 
-    // Get configuration from environment
     let config = Config::from_env();
 
     info!(
@@ -76,60 +75,53 @@ async fn main() -> Result<(), anyhow::Error> {
     let addr = format!("0.0.0.0:{port}");
     health::spawn_health_server(addr, heartbeat.clone());
 
-    // Main polling loop
     loop {
         if let Err(e) = poll_and_process(&config).await {
             error!("Error during poll cycle: {:?}", e);
         }
 
-        // Update heartbeat after each cycle (even if poll had errors, the loop is still running)
+        // Update heartbeat after each cycle
         heartbeat.touch();
 
         tokio::time::sleep(Duration::from_secs(config.poll_interval)).await;
     }
 }
 
-/// Poll for new files and process them in batches
 async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     use deltalake::logstore::{StorageConfig, logstore_for};
 
-    const FILE_BATCH_SIZE: usize = 100; // Process 100 files per batch
+    const FILE_BATCH_SIZE: usize = 100;
 
     debug!(
         "Polling gs://{}/{} for new files",
         config.source_bucket, config.source_prefix
     );
 
-    // Get object store for the source bucket (still needed for listing metadata)
     let bucket_url = Url::parse(&format!("gs://{}", config.source_bucket))?;
     let store = logstore_for(&bucket_url, StorageConfig::default())?;
     let object_store = store.object_store(None);
 
-    // Load current state
     let mut state = load_state(&config.state_file_uri).await?;
 
-    // List objects with prefix, filtering as we go
     let list_prefix = (!config.source_prefix.is_empty())
         .then(|| deltalake::Path::from(config.source_prefix.as_str()));
 
-    // Stream the listing and filter to new files only
     let mut listing = object_store.list(list_prefix.as_ref());
     let mut new_files = Vec::with_capacity(FILE_BATCH_SIZE);
     let mut total_listed = 0usize;
     let mut total_processed = 0usize;
 
-    // Open the Delta table once
+    // Open delta table
     let mut table = oxbow::lock::open_table(&config.delta_table_uri).await?;
     let arrow_schema = table.snapshot()?.snapshot().arrow_schema();
 
-    // Stream through listing and process in batches
     while let Some(result) = listing.next().await {
         let obj = result?;
         total_listed += 1;
 
         let name = obj.location.as_ref();
 
-        // Skip files in the archive prefix
+        // Skip archived files
         if name.starts_with(ARCHIVE_PREFIX) {
             continue;
         }
@@ -163,7 +155,6 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
         }
     }
 
-    // Process remaining files
     if !new_files.is_empty() {
         info!(
             "Processing final batch ({} files, {} total listed)",
@@ -196,7 +187,6 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Process a batch of files and append to Delta table
 async fn process_file_batch(
     files: &[deltalake::ObjectMeta],
     object_store: &Arc<dyn ObjectStore>,
@@ -212,7 +202,6 @@ async fn process_file_batch(
     let mut total_records: usize = 0;
     let mut new_fields: Vec<StructField> = Vec::new();
 
-    // Determine which schema to use for parsing
     let parsing_schema: Arc<deltalake::arrow::datatypes::Schema> = if config.schema_evolution {
         // Sample schema from first file to detect new fields
         if let Some(first_file) = files.first() {
@@ -260,7 +249,6 @@ async fn process_file_batch(
     let file_timeout = Duration::from_secs(config.file_timeout_secs);
     let max_retries = config.max_file_retries;
 
-    // Stream file downloads and parse results as they complete (with per-file timeout)
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
             let store = Arc::clone(object_store);
@@ -289,7 +277,6 @@ async fn process_file_batch(
         })
         .buffer_unordered(config.download_concurrency);
 
-    // Collect batches from all files
     while let Some((file_path, result)) = stream.next().await {
         match result {
             Ok(Ok((batches, records))) => {
@@ -313,20 +300,16 @@ async fn process_file_batch(
 
     let files_processed = processed_paths.len();
 
-    // Commit all batches in a single transaction
     if !all_batches.is_empty() {
         let batch_iter = all_batches.into_iter().map(Ok);
 
         let updated_table = if !new_fields.is_empty() {
-            // Commit with schema evolution
             commit_with_schema_evolution(table.clone(), batch_iter, &new_fields).await?
         } else {
-            // Standard commit without schema changes
             oxbow::write::append_batches(table.clone(), batch_iter).await?
         };
         *table = updated_table;
 
-        // Save state for all processed files
         state
             .processed_files
             .extend(processed_paths.iter().cloned());
@@ -344,7 +327,6 @@ async fn process_file_batch(
             }
         );
 
-        // Archive processed files
         let mut archived = 0;
         for path in &processed_paths {
             match archive_file(object_store, path, &config.source_prefix, ARCHIVE_PREFIX).await {
@@ -362,7 +344,6 @@ async fn process_file_batch(
     Ok(files_processed)
 }
 
-/// Commit record batches with schema evolution in an atomic transaction
 async fn commit_with_schema_evolution(
     mut table: deltalake::DeltaTable,
     batches: impl IntoIterator<
@@ -374,10 +355,8 @@ async fn commit_with_schema_evolution(
     use deltalake::protocol::DeltaOperation;
     use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
 
-    // Create metadata action for schema evolution
     let metadata_action = create_metadata_action(&table, new_fields)?;
 
-    // Write data files using RecordBatchWriter
     let mut writer = RecordBatchWriter::for_table(&table)?
         .with_commit_properties(oxbow::default_commit_properties());
 
@@ -414,14 +393,12 @@ async fn commit_with_schema_evolution(
     Ok(table)
 }
 
-/// Move a file from source to archive prefix (copy then delete)
 async fn archive_file(
     object_store: &Arc<dyn ObjectStore>,
     source_path: &str,
     source_prefix: &str,
     archive_prefix: &str,
 ) -> Result<(), anyhow::Error> {
-    // Compute archive path by replacing source prefix with archive prefix
     let archive_path = if source_path.starts_with(source_prefix) {
         format!("{}{}", archive_prefix, &source_path[source_prefix.len()..])
     } else {
@@ -431,10 +408,7 @@ async fn archive_file(
     let from = deltalake::Path::from(source_path);
     let to = deltalake::Path::from(archive_path.as_str());
 
-    // Copy to archive location
     object_store.copy(&from, &to).await?;
-
-    // Delete original
     object_store.delete(&from).await?;
 
     debug!("Archived {} -> {}", source_path, archive_path);

@@ -1,6 +1,5 @@
 use tracing::warn;
 
-/// Configuration loaded from environment variables
 pub struct Config {
     pub source_bucket: String,
     pub source_prefix: String,
@@ -17,7 +16,6 @@ pub struct Config {
     pub max_file_retries: usize,
 }
 
-/// Parse an environment variable with a default, logging any parse errors
 fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T
 where
     T::Err: std::fmt::Display,

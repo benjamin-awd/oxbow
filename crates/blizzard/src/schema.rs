@@ -14,14 +14,12 @@ use std::io::Cursor;
 use std::sync::Arc;
 use tracing::log::*;
 
-/// Infer Arrow schema from a JSON sample buffer
 pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema, anyhow::Error> {
     let cursor = Cursor::new(sample);
     let (schema, _) = infer_json_schema_from_seekable(cursor, None)?;
     Ok(schema)
 }
 
-/// Check if file schema contains fields not in table schema
 pub fn needs_evolution(table_schema: &Schema, file_schema: &ArrowSchema) -> bool {
     for field in file_schema.fields() {
         if table_schema.index_of(field.name()).is_none() {
@@ -31,7 +29,6 @@ pub fn needs_evolution(table_schema: &Schema, file_schema: &ArrowSchema) -> bool
     false
 }
 
-/// Find new fields in file schema that don't exist in table schema
 pub fn merge_schemas(table_schema: &Schema, file_schema: &ArrowSchema) -> Vec<StructField> {
     let mut new_fields = Vec::new();
 
@@ -52,7 +49,6 @@ pub fn merge_schemas(table_schema: &Schema, file_schema: &ArrowSchema) -> Vec<St
     new_fields
 }
 
-/// Create a merged Arrow schema that includes both table and new file fields
 pub fn create_merged_arrow_schema(
     table_schema: &ArrowSchema,
     file_schema: &ArrowSchema,
@@ -76,7 +72,6 @@ pub fn create_merged_arrow_schema(
     ArrowSchema::new_with_metadata(fields, table_schema.metadata.clone())
 }
 
-/// Create a Delta Metadata action for schema evolution
 pub fn create_metadata_action(
     table: &DeltaTable,
     new_fields: &[StructField],
@@ -85,7 +80,6 @@ pub fn create_metadata_action(
     let table_schema = snapshot.schema();
     let table_metadata = snapshot.metadata();
 
-    // Build new schema with existing + new fields
     let mut all_fields: Vec<StructField> = table_schema.fields().cloned().collect();
     all_fields.extend(new_fields.iter().cloned());
 

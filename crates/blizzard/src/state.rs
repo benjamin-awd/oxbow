@@ -13,7 +13,6 @@ pub struct FileFailure {
 }
 
 /// State file tracking which files have been processed
-/// Uses serde(default) for backward compatibility with old state files
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProcessedState {
     #[serde(default)]
@@ -61,7 +60,6 @@ impl ProcessedState {
     }
 }
 
-/// Load processed state from GCS
 pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::Error> {
     use deltalake::logstore::{StorageConfig, logstore_for};
 
@@ -87,7 +85,6 @@ pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::
     }
 }
 
-/// Save processed state to GCS
 pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<(), anyhow::Error> {
     use deltalake::logstore::{StorageConfig, logstore_for};
 
