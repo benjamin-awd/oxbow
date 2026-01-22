@@ -31,14 +31,16 @@ where
 
 impl Config {
     pub fn from_env() -> Self {
+        let delta_table_uri = std::env::var("DELTA_TABLE_URI")
+            .expect("DELTA_TABLE_URI environment variable required");
+        let state_file_uri = format!("{delta_table_uri}/_file_loader_state.json");
+
         Self {
             source_bucket: std::env::var("SOURCE_BUCKET")
                 .expect("SOURCE_BUCKET environment variable required"),
             source_prefix: std::env::var("SOURCE_PREFIX").unwrap_or_default(),
-            delta_table_uri: std::env::var("DELTA_TABLE_URI")
-                .expect("DELTA_TABLE_URI environment variable required"),
-            state_file_uri: std::env::var("STATE_FILE_URI")
-                .expect("STATE_FILE_URI environment variable required"),
+            delta_table_uri,
+            state_file_uri,
             poll_interval: parse_env_or("POLL_INTERVAL_SECS", 10),
             download_concurrency: parse_env_or("DOWNLOAD_CONCURRENCY", 50),
             batch_size: parse_env_or("BATCH_SIZE", 4096),

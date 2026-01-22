@@ -12,9 +12,10 @@
 /// - SOURCE_PREFIX: Optional prefix within the bucket (default: "")
 /// - DELTA_TABLE_URI: Destination Delta table (e.g., gs://bucket/table)
 /// - POLL_INTERVAL_SECS: Polling interval in seconds (default: 10)
-/// - STATE_FILE_URI: GCS URI for state file tracking processed files
 /// - DOWNLOAD_CONCURRENCY: Concurrent file downloads (default: 50)
 /// - BATCH_SIZE: Records per batch when parsing JSON (default: 4096)
+///
+/// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
 mod config;
 mod read;
@@ -57,7 +58,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config.batch_size
     );
 
-    // Start health check server in background (Cloud Run requires HTTP responsiveness)
+    // Start health check server
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
     tokio::spawn(async move {
