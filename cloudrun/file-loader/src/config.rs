@@ -15,10 +15,6 @@ pub struct Config {
     pub file_timeout_secs: u64,
     /// Maximum number of consecutive failures for a file before marking it as permanently failed (default: 3)
     pub max_file_retries: usize,
-    /// Number of days to retain entries in state file (default: 7, set to 0 to disable pruning)
-    pub state_retention_days: u64,
-    /// Prefix to move processed files to (e.g., "archive/"). Empty string disables archiving.
-    pub archive_prefix: String,
 }
 
 /// Parse an environment variable with a default, logging any parse errors
@@ -58,8 +54,6 @@ impl Config {
             schema_sample_bytes: parse_env_or("SCHEMA_SAMPLE_BYTES", 64 * 1024),
             file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
             max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
-            state_retention_days: parse_env_or("STATE_RETENTION_DAYS", 7),
-            archive_prefix: std::env::var("ARCHIVE_PREFIX").unwrap_or_default(),
         }
     }
 }

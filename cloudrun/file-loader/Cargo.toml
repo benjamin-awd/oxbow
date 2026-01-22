@@ -30,7 +30,6 @@ chrono = { workspace = true }
 
 oxbow = { path = "../../crates/oxbow" }
 flate2 = "1"
-regex = "1"
 
 [dev-dependencies]
 

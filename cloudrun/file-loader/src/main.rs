@@ -37,6 +37,9 @@ use read::{
 use schema::{create_merged_arrow_schema, create_metadata_action, merge_schemas, needs_evolution};
 use state::{ProcessedState, load_state, save_state};
 
+/// Prefix where processed files are moved to
+const ARCHIVE_PREFIX: &str = "processed/";
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     deltalake::gcp::register_handlers(None);
@@ -52,7 +55,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}, state_retention_days={}, archive_prefix={}",
+        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
@@ -63,13 +66,7 @@ async fn main() -> Result<(), anyhow::Error> {
         config.schema_evolution,
         config.schema_sample_bytes,
         config.file_timeout_secs,
-        config.max_file_retries,
-        config.state_retention_days,
-        if config.archive_prefix.is_empty() {
-            "(disabled)"
-        } else {
-            &config.archive_prefix
-        }
+        config.max_file_retries
     );
 
     // Start health check server with heartbeat tracking
@@ -111,16 +108,6 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     // Load current state
     let mut state = load_state(&config.state_file_uri).await?;
 
-    // Prune old entries from state
-    let prune_stats = state.prune_old_entries(config.state_retention_days);
-    if prune_stats.processed_pruned > 0 || prune_stats.failed_pruned > 0 {
-        info!(
-            "Pruned state: {} processed entries, {} failed entries (retention: {} days)",
-            prune_stats.processed_pruned, prune_stats.failed_pruned, config.state_retention_days
-        );
-        save_state(&config.state_file_uri, &state).await?;
-    }
-
     // List objects with prefix, filtering as we go
     let list_prefix = (!config.source_prefix.is_empty())
         .then(|| deltalake::Path::from(config.source_prefix.as_str()));
@@ -143,7 +130,7 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
         let name = obj.location.as_ref();
 
         // Skip files in the archive prefix
-        if !config.archive_prefix.is_empty() && name.starts_with(&config.archive_prefix) {
+        if name.starts_with(ARCHIVE_PREFIX) {
             continue;
         }
 
@@ -357,27 +344,18 @@ async fn process_file_batch(
             }
         );
 
-        // Archive processed files if configured
-        if !config.archive_prefix.is_empty() {
-            let mut archived = 0;
-            for path in &processed_paths {
-                match archive_file(
-                    object_store,
-                    path,
-                    &config.source_prefix,
-                    &config.archive_prefix,
-                )
-                .await
-                {
-                    Ok(()) => archived += 1,
-                    Err(e) => {
-                        warn!("Failed to archive {}: {:?}", path, e);
-                    }
+        // Archive processed files
+        let mut archived = 0;
+        for path in &processed_paths {
+            match archive_file(object_store, path, &config.source_prefix, ARCHIVE_PREFIX).await {
+                Ok(()) => archived += 1,
+                Err(e) => {
+                    warn!("Failed to archive {}: {:?}", path, e);
                 }
             }
-            if archived > 0 {
-                info!("Archived {} files to {}", archived, config.archive_prefix);
-            }
+        }
+        if archived > 0 {
+            info!("Archived {} files to {}", archived, ARCHIVE_PREFIX);
         }
     }
 
