@@ -58,7 +58,7 @@ fn test_schema() -> Arc<deltalake::arrow::datatypes::Schema> {
 async fn deserialize_stream(
     mut reader: impl AsyncBufRead + Unpin,
     decoder: &mut Decoder,
-) -> Result<Vec<RecordBatch>, anyhow::Error> {
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
     let mut batches = Vec::new();
 
     loop {
@@ -91,7 +91,7 @@ async fn parse_data(
     data: Vec<u8>,
     arrow_schema: Arc<deltalake::arrow::datatypes::Schema>,
     is_compressed: bool,
-) -> Result<(Vec<RecordBatch>, usize), anyhow::Error> {
+) -> Result<(Vec<RecordBatch>, usize), Box<dyn std::error::Error + Send + Sync>> {
     let cursor = Cursor::new(data);
 
     let buffered: Box<dyn AsyncBufRead + Unpin + Send> = if is_compressed {
@@ -158,7 +158,7 @@ async fn run_benchmark(
     records_per_file: usize,
     compressed: bool,
     concurrency: usize,
-) -> Result<BenchmarkResult, anyhow::Error> {
+) -> Result<BenchmarkResult, Box<dyn std::error::Error + Send + Sync>> {
     // Generate test data
     let raw_data = generate_jsonl_data(records_per_file);
     let raw_size = raw_data.len();
@@ -218,7 +218,7 @@ async fn run_benchmark(
 use futures::StreamExt;
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("File Loader Benchmark");
     println!("=====================\n");
     println!("This benchmarks the core JSON-to-Arrow parsing logic.\n");

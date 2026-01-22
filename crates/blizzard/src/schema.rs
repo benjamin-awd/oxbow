@@ -10,13 +10,17 @@ use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::kernel::models;
 use deltalake::kernel::schema::{Schema, StructField};
 use deltalake::kernel::{Action, MetadataExt};
+use snafu::ResultExt;
 use std::io::Cursor;
 use std::sync::Arc;
 use tracing::log::*;
 
-pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema, anyhow::Error> {
+use crate::error::{DeltaTableSnafu, Result, SchemaInferenceSnafu};
+
+pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema> {
     let cursor = Cursor::new(sample);
-    let (schema, _) = infer_json_schema_from_seekable(cursor, None)?;
+    let (schema, _) =
+        infer_json_schema_from_seekable(cursor, None).context(SchemaInferenceSnafu)?;
     Ok(schema)
 }
 
@@ -72,30 +76,37 @@ pub fn create_merged_arrow_schema(
     ArrowSchema::new_with_metadata(fields, table_schema.metadata.clone())
 }
 
-pub fn create_metadata_action(
-    table: &DeltaTable,
-    new_fields: &[StructField],
-) -> Result<Action, anyhow::Error> {
-    let snapshot = table.snapshot()?;
+pub fn create_metadata_action(table: &DeltaTable, new_fields: &[StructField]) -> Result<Action> {
+    let snapshot = table.snapshot().context(DeltaTableSnafu)?;
     let table_schema = snapshot.schema();
     let table_metadata = snapshot.metadata();
 
     let mut all_fields: Vec<StructField> = table_schema.fields().cloned().collect();
     all_fields.extend(new_fields.iter().cloned());
 
-    let new_schema = Schema::try_new(all_fields)?;
+    let new_schema = Schema::try_new(all_fields)
+        .map_err(|e| deltalake::DeltaTableError::from(e))
+        .context(DeltaTableSnafu)?;
 
     let mut action = models::new_metadata(
         &new_schema,
         table_metadata.partition_columns().clone(),
         table_metadata.configuration().clone(),
-    )?;
+    )
+    .map_err(|e| deltalake::DeltaTableError::from(e))
+    .context(DeltaTableSnafu)?;
 
     if let Some(name) = table_metadata.name() {
-        action = action.with_name(name.into())?;
+        action = action
+            .with_name(name.into())
+            .map_err(|e| deltalake::DeltaTableError::from(e))
+            .context(DeltaTableSnafu)?;
     }
     if let Some(description) = table_metadata.description() {
-        action = action.with_description(description.into())?;
+        action = action
+            .with_description(description.into())
+            .map_err(|e| deltalake::DeltaTableError::from(e))
+            .context(DeltaTableSnafu)?;
     }
 
     info!(

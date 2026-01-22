@@ -18,6 +18,7 @@
 /// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
 mod config;
+mod error;
 mod health;
 mod read;
 mod schema;
@@ -31,6 +32,9 @@ use tracing::log::*;
 use url::Url;
 
 use config::Config;
+use error::{
+    DeltaTableSnafu, Error, ObjectStoreError, Result, SchemaInferenceSnafu, UrlParseSnafu,
+};
 use read::{
     is_gzip_compressed, is_supported_json_file, sample_schema_from_file, stream_and_parse_file,
 };
@@ -41,7 +45,7 @@ use state::{ProcessedState, load_state, save_state};
 const ARCHIVE_PREFIX: &str = "processed/";
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+async fn main() -> std::result::Result<(), Error> {
     deltalake::gcp::register_handlers(None);
 
     tracing_subscriber::fmt()
@@ -77,7 +81,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     loop {
         if let Err(e) = poll_and_process(&config).await {
-            error!("Error during poll cycle: {:?}", e);
+            if e.is_fatal() {
+                error!("Fatal error during poll cycle: {:?}", e);
+            } else if e.is_transient() {
+                warn!("Transient error during poll cycle (will retry): {:?}", e);
+            } else {
+                error!("Error during poll cycle: {:?}", e);
+            }
         }
 
         // Update heartbeat after each cycle
@@ -87,8 +97,9 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 }
 
-async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
+async fn poll_and_process(config: &Config) -> Result<()> {
     use deltalake::logstore::{StorageConfig, logstore_for};
+    use snafu::ResultExt;
 
     const FILE_BATCH_SIZE: usize = 100;
 
@@ -97,8 +108,11 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
         config.source_bucket, config.source_prefix
     );
 
-    let bucket_url = Url::parse(&format!("gs://{}", config.source_bucket))?;
-    let store = logstore_for(&bucket_url, StorageConfig::default())?;
+    let bucket_url =
+        Url::parse(&format!("gs://{}", config.source_bucket)).context(UrlParseSnafu {
+            url: format!("gs://{}", config.source_bucket),
+        })?;
+    let store = logstore_for(&bucket_url, StorageConfig::default()).context(DeltaTableSnafu)?;
     let object_store = store.object_store(None);
 
     let mut state = load_state(&config.state_file_uri).await?;
@@ -112,11 +126,19 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     let mut total_processed = 0usize;
 
     // Open delta table
-    let mut table = oxbow::lock::open_table(&config.delta_table_uri).await?;
-    let arrow_schema = table.snapshot()?.snapshot().arrow_schema();
+    let mut table = oxbow::lock::open_table(&config.delta_table_uri)
+        .await
+        .context(DeltaTableSnafu)?;
+    let arrow_schema = table
+        .snapshot()
+        .context(DeltaTableSnafu)?
+        .snapshot()
+        .arrow_schema();
 
     while let Some(result) = listing.next().await {
-        let obj = result?;
+        let obj = result.map_err(|e| {
+            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
+        })?;
         total_listed += 1;
 
         let name = obj.location.as_ref();
@@ -194,8 +216,9 @@ async fn process_file_batch(
     table: &mut deltalake::DeltaTable,
     state: &mut ProcessedState,
     config: &Config,
-) -> Result<usize, anyhow::Error> {
+) -> Result<usize> {
     use deltalake::kernel::StructField;
+    use snafu::ResultExt;
 
     let mut all_batches: Vec<deltalake::arrow::array::RecordBatch> = Vec::new();
     let mut processed_paths: Vec<String> = Vec::new();
@@ -217,7 +240,7 @@ async fn process_file_batch(
             .await
             {
                 Ok(file_schema) => {
-                    let table_schema = table.snapshot()?.schema();
+                    let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
                     if needs_evolution(&table_schema, &file_schema) {
                         new_fields = merge_schemas(&table_schema, &file_schema);
                         let merged = create_merged_arrow_schema(arrow_schema, &file_schema);
@@ -287,13 +310,14 @@ async fn process_file_batch(
                 total_records += records;
             }
             Ok(Err(e)) => {
-                let error_msg = format!("{:?}", e);
-                state.record_failure(&file_path, &error_msg, max_retries);
+                state.record_failure(&file_path, &e, max_retries);
             }
             Err(_) => {
-                let error_msg = format!("Timeout after {}s", file_timeout.as_secs());
+                let timeout_error = Error::Timeout {
+                    duration_secs: file_timeout.as_secs(),
+                };
                 error!("File processing timed out: {}", file_path);
-                state.record_failure(&file_path, &error_msg, max_retries);
+                state.record_failure(&file_path, &timeout_error, max_retries);
             }
         }
     }
@@ -306,7 +330,9 @@ async fn process_file_batch(
         let updated_table = if !new_fields.is_empty() {
             commit_with_schema_evolution(table.clone(), batch_iter, &new_fields).await?
         } else {
-            oxbow::write::append_batches(table.clone(), batch_iter).await?
+            oxbow::write::append_batches(table.clone(), batch_iter)
+                .await
+                .context(DeltaTableSnafu)?
         };
         *table = updated_table;
 
@@ -331,6 +357,16 @@ async fn process_file_batch(
         for path in &processed_paths {
             match archive_file(object_store, path, &config.source_prefix, ARCHIVE_PREFIX).await {
                 Ok(()) => archived += 1,
+                Err(Error::ObjectStore {
+                    source: ObjectStoreError::NotFound { .. },
+                }) => {
+                    // File already archived or deleted - treat as success
+                    debug!(
+                        "File {} already gone during archive, treating as success",
+                        path
+                    );
+                    archived += 1;
+                }
                 Err(e) => {
                     warn!("Failed to archive {}: {:?}", path, e);
                 }
@@ -347,32 +383,37 @@ async fn process_file_batch(
 async fn commit_with_schema_evolution(
     mut table: deltalake::DeltaTable,
     batches: impl IntoIterator<
-        Item = Result<deltalake::arrow::array::RecordBatch, deltalake::arrow::error::ArrowError>,
+        Item = std::result::Result<
+            deltalake::arrow::array::RecordBatch,
+            deltalake::arrow::error::ArrowError,
+        >,
     >,
     new_fields: &[deltalake::kernel::StructField],
-) -> Result<deltalake::DeltaTable, anyhow::Error> {
+) -> Result<deltalake::DeltaTable> {
     use deltalake::kernel::transaction::CommitBuilder;
     use deltalake::protocol::DeltaOperation;
     use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
+    use snafu::ResultExt;
 
     let metadata_action = create_metadata_action(&table, new_fields)?;
 
-    let mut writer = RecordBatchWriter::for_table(&table)?
+    let mut writer = RecordBatchWriter::for_table(&table)
+        .context(DeltaTableSnafu)?
         .with_commit_properties(oxbow::default_commit_properties());
 
     for batch in batches {
-        let batch = batch?;
-        writer.write(batch).await?;
+        let batch = batch.context(SchemaInferenceSnafu)?;
+        writer.write(batch).await.context(DeltaTableSnafu)?;
     }
 
     // Flush to get add actions without committing
-    let add_actions = writer.flush().await?;
+    let add_actions = writer.flush().await.context(DeltaTableSnafu)?;
 
     // Combine metadata + add actions in single atomic commit
     let mut all_actions = vec![metadata_action];
     all_actions.extend(add_actions.into_iter().map(deltalake::kernel::Action::Add));
 
-    let snapshot = table.snapshot()?;
+    let snapshot = table.snapshot().context(DeltaTableSnafu)?;
     let commit = CommitBuilder::from(oxbow::default_commit_properties())
         .with_actions(all_actions)
         .build(
@@ -385,10 +426,13 @@ async fn commit_with_schema_evolution(
             },
         );
 
-    let post_commit = commit.await?;
+    let post_commit = commit.await.context(DeltaTableSnafu)?;
 
     // Reload table with new version
-    table.load_version(post_commit.version()).await?;
+    table
+        .load_version(post_commit.version())
+        .await
+        .context(DeltaTableSnafu)?;
 
     Ok(table)
 }
@@ -398,7 +442,7 @@ async fn archive_file(
     source_path: &str,
     source_prefix: &str,
     archive_prefix: &str,
-) -> Result<(), anyhow::Error> {
+) -> Result<()> {
     let archive_path = if source_path.starts_with(source_prefix) {
         format!("{}{}", archive_prefix, &source_path[source_prefix.len()..])
     } else {
@@ -408,8 +452,14 @@ async fn archive_file(
     let from = deltalake::Path::from(source_path);
     let to = deltalake::Path::from(archive_path.as_str());
 
-    object_store.copy(&from, &to).await?;
-    object_store.delete(&from).await?;
+    object_store
+        .copy(&from, &to)
+        .await
+        .map_err(|e| ObjectStoreError::from_source(e, source_path))?;
+    object_store
+        .delete(&from)
+        .await
+        .map_err(|e| ObjectStoreError::from_source(e, source_path))?;
 
     debug!("Archived {} -> {}", source_path, archive_path);
     Ok(())

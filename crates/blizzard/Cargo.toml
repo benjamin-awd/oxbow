@@ -12,7 +12,7 @@ name = "blizzard"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = { workspace = true }
+snafu = "0.8"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 axum = "0.8"
 deltalake = { workspace = true }

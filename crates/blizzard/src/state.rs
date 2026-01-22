@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use tracing::log::*;
 use url::Url;
+
+use crate::error::{
+    DeltaTableSnafu, Error, ErrorCategory, ObjectStoreError, Result, StateSerializationSnafu,
+    UrlParseSnafu,
+};
 
 /// Tracks failure information for a file
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -10,6 +16,12 @@ pub struct FileFailure {
     pub retry_count: usize,
     /// Last error message
     pub last_error: String,
+    /// Error category for structured tracking
+    #[serde(default)]
+    pub error_category: Option<ErrorCategory>,
+    /// Whether the error is transient (retryable)
+    #[serde(default)]
+    pub is_transient: Option<bool>,
 }
 
 /// State file tracking which files have been processed
@@ -27,23 +39,42 @@ pub struct ProcessedState {
 
 impl ProcessedState {
     /// Record a file failure, returns true if the file should be retried
-    pub fn record_failure(&mut self, path: &str, error: &str, max_retries: usize) -> bool {
+    pub fn record_failure(&mut self, path: &str, error: &Error, max_retries: usize) -> bool {
+        self.record_failure_impl(
+            path,
+            &format!("{:?}", error),
+            Some(ErrorCategory::from(error)),
+            Some(error.is_transient()),
+            max_retries,
+        )
+    }
+
+    fn record_failure_impl(
+        &mut self,
+        path: &str,
+        error_msg: &str,
+        error_category: Option<ErrorCategory>,
+        is_transient: Option<bool>,
+        max_retries: usize,
+    ) -> bool {
         let entry = self.failed_files.entry(path.to_string()).or_default();
         entry.retry_count += 1;
-        entry.last_error = error.to_string();
+        entry.last_error = error_msg.to_string();
+        entry.error_category = error_category;
+        entry.is_transient = is_transient;
 
         if entry.retry_count >= max_retries {
             warn!(
-                "File {} has failed {} times, marking as permanently failed: {}",
-                path, entry.retry_count, error
+                "File {} has failed {} times (category: {:?}, transient: {:?}), marking as permanently failed: {}",
+                path, entry.retry_count, error_category, is_transient, error_msg
             );
             self.permanently_failed.insert(path.to_string());
             self.failed_files.remove(path);
             false
         } else {
             warn!(
-                "File {} failed (attempt {}/{}): {}",
-                path, entry.retry_count, max_retries, error
+                "File {} failed (attempt {}/{}, category: {:?}, transient: {:?}): {}",
+                path, entry.retry_count, max_retries, error_category, is_transient, error_msg
             );
             true
         }
@@ -60,17 +91,23 @@ impl ProcessedState {
     }
 }
 
-pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::Error> {
+pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState> {
     use deltalake::logstore::{StorageConfig, logstore_for};
 
-    let url = Url::parse(state_file_uri)?;
-    let store = logstore_for(&url, StorageConfig::default())?;
+    let url = Url::parse(state_file_uri).context(UrlParseSnafu {
+        url: state_file_uri,
+    })?;
+    let store = logstore_for(&url, StorageConfig::default()).context(DeltaTableSnafu)?;
     let path = deltalake::Path::from(url.path());
 
     match store.object_store(None).get(&path).await {
         Ok(result) => {
-            let bytes = result.bytes().await?;
-            let state: ProcessedState = serde_json::from_slice(&bytes)?;
+            let bytes = result
+                .bytes()
+                .await
+                .map_err(|e| ObjectStoreError::from_source(e, state_file_uri))?;
+            let state: ProcessedState =
+                serde_json::from_slice(&bytes).context(StateSerializationSnafu)?;
             debug!(
                 "Loaded state with {} processed files",
                 state.processed_files.len()
@@ -81,19 +118,25 @@ pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::
             debug!("No existing state file, starting fresh");
             Ok(ProcessedState::default())
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(ObjectStoreError::from_source(e, state_file_uri).into()),
     }
 }
 
-pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<(), anyhow::Error> {
+pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<()> {
     use deltalake::logstore::{StorageConfig, logstore_for};
 
-    let url = Url::parse(state_file_uri)?;
-    let store = logstore_for(&url, StorageConfig::default())?;
+    let url = Url::parse(state_file_uri).context(UrlParseSnafu {
+        url: state_file_uri,
+    })?;
+    let store = logstore_for(&url, StorageConfig::default()).context(DeltaTableSnafu)?;
     let path = deltalake::Path::from(url.path());
 
-    let bytes = serde_json::to_vec_pretty(state)?;
-    store.object_store(None).put(&path, bytes.into()).await?;
+    let bytes = serde_json::to_vec_pretty(state).context(StateSerializationSnafu)?;
+    store
+        .object_store(None)
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| ObjectStoreError::from_source(e, state_file_uri))?;
 
     Ok(())
 }
@@ -101,6 +144,13 @@ pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ProcessedState {
+        /// Test helper: record a failure with a string error message
+        fn record_failure_str(&mut self, path: &str, error: &str, max_retries: usize) -> bool {
+            self.record_failure_impl(path, error, None, None, max_retries)
+        }
+    }
 
     #[test]
     fn test_state_serialization() {
@@ -120,17 +170,17 @@ mod tests {
         let max_retries = 3;
 
         // First failure - should retry
-        assert!(state.record_failure("file1.json", "error 1", max_retries));
+        assert!(state.record_failure_str("file1.json", "error 1", max_retries));
         assert!(!state.should_skip("file1.json"));
         assert_eq!(state.failed_files.get("file1.json").unwrap().retry_count, 1);
 
         // Second failure - should retry
-        assert!(state.record_failure("file1.json", "error 2", max_retries));
+        assert!(state.record_failure_str("file1.json", "error 2", max_retries));
         assert!(!state.should_skip("file1.json"));
         assert_eq!(state.failed_files.get("file1.json").unwrap().retry_count, 2);
 
         // Third failure - should be permanently failed
-        assert!(!state.record_failure("file1.json", "error 3", max_retries));
+        assert!(!state.record_failure_str("file1.json", "error 3", max_retries));
         assert!(state.should_skip("file1.json"));
         assert!(state.permanently_failed.contains("file1.json"));
         assert!(!state.failed_files.contains_key("file1.json"));
@@ -141,7 +191,7 @@ mod tests {
         let mut state = ProcessedState::default();
 
         // Record a failure
-        state.record_failure("file1.json", "error", 3);
+        state.record_failure_str("file1.json", "error", 3);
         assert!(state.failed_files.contains_key("file1.json"));
 
         // Clear on success
