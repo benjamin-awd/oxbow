@@ -52,7 +52,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}",
+        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
@@ -61,7 +61,9 @@ async fn main() -> Result<(), anyhow::Error> {
         config.download_concurrency,
         config.batch_size,
         config.schema_evolution,
-        config.schema_sample_bytes
+        config.schema_sample_bytes,
+        config.file_timeout_secs,
+        config.max_file_retries
     );
 
     // Start health check server
@@ -131,7 +133,7 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
         total_listed += 1;
 
         let name = obj.location.as_ref();
-        if is_supported_json_file(name) && !state.processed_files.contains(name) {
+        if is_supported_json_file(name) && !state.should_skip(name) {
             new_files.push(obj);
         }
 
@@ -254,7 +256,10 @@ async fn process_file_batch(
         Arc::clone(arrow_schema)
     };
 
-    // Stream file downloads and parse results as they complete
+    let file_timeout = Duration::from_secs(config.file_timeout_secs);
+    let max_retries = config.max_file_retries;
+
+    // Stream file downloads and parse results as they complete (with per-file timeout)
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
             let store = Arc::clone(object_store);
@@ -271,9 +276,13 @@ async fn process_file_batch(
                     file_path, size, is_compressed
                 );
 
-                let result =
-                    stream_and_parse_file(&store, &location, schema, is_compressed, batch_size)
-                        .await;
+                // Apply timeout to the file download and parsing
+                let result = tokio::time::timeout(
+                    file_timeout,
+                    stream_and_parse_file(&store, &location, schema, is_compressed, batch_size),
+                )
+                .await;
+
                 (file_path, result)
             }
         })
@@ -282,14 +291,21 @@ async fn process_file_batch(
     // Collect batches from all files
     while let Some((file_path, result)) = stream.next().await {
         match result {
-            Ok((batches, records)) => {
+            Ok(Ok((batches, records))) => {
                 info!("Parsed {} records from {}", records, file_path);
                 all_batches.extend(batches);
+                state.clear_failure(&file_path);
                 processed_paths.push(file_path);
                 total_records += records;
             }
-            Err(e) => {
-                error!("Failed to process {}: {:?}", file_path, e);
+            Ok(Err(e)) => {
+                let error_msg = format!("{:?}", e);
+                state.record_failure(&file_path, &error_msg, max_retries);
+            }
+            Err(_) => {
+                let error_msg = format!("Timeout after {}s", file_timeout.as_secs());
+                error!("File processing timed out: {}", file_path);
+                state.record_failure(&file_path, &error_msg, max_retries);
             }
         }
     }

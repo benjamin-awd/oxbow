@@ -7,7 +7,6 @@ use futures::TryStreamExt;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
-use tracing::log::*;
 
 use crate::schema::infer_schema_from_json_sample;
 

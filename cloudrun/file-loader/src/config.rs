@@ -11,6 +11,10 @@ pub struct Config {
     pub batch_size: usize,
     pub schema_evolution: bool,
     pub schema_sample_bytes: usize,
+    /// Timeout in seconds for downloading and processing a single file (default: 300s / 5 min)
+    pub file_timeout_secs: u64,
+    /// Maximum number of consecutive failures for a file before marking it as permanently failed (default: 3)
+    pub max_file_retries: usize,
 }
 
 /// Parse an environment variable with a default, logging any parse errors
@@ -48,6 +52,8 @@ impl Config {
             batch_size: parse_env_or("BATCH_SIZE", 4096),
             schema_evolution: std::env::var("SCHEMA_EVOLUTION").is_ok(),
             schema_sample_bytes: parse_env_or("SCHEMA_SAMPLE_BYTES", 64 * 1024),
+            file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
+            max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
         }
     }
 }
