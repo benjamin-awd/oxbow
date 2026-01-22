@@ -19,6 +19,7 @@
 ///
 mod config;
 mod read;
+mod schema;
 mod state;
 
 use axum::{Router, routing::get};
@@ -30,7 +31,10 @@ use tracing::log::*;
 use url::Url;
 
 use config::Config;
-use read::{is_gzip_compressed, is_supported_json_file, stream_and_parse_file};
+use read::{
+    is_gzip_compressed, is_supported_json_file, sample_schema_from_file, stream_and_parse_file,
+};
+use schema::{create_merged_arrow_schema, create_metadata_action, merge_schemas, needs_evolution};
 use state::{ProcessedState, load_state, save_state};
 
 #[tokio::main]
@@ -48,14 +52,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}",
+        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
         config.state_file_uri,
         config.poll_interval,
         config.download_concurrency,
-        config.batch_size
+        config.batch_size,
+        config.schema_evolution,
+        config.schema_sample_bytes
     );
 
     // Start health check server
@@ -196,15 +202,63 @@ async fn process_file_batch(
     state: &mut ProcessedState,
     config: &Config,
 ) -> Result<usize, anyhow::Error> {
+    use deltalake::kernel::StructField;
+
     let mut all_batches: Vec<deltalake::arrow::array::RecordBatch> = Vec::new();
     let mut processed_paths: Vec<String> = Vec::new();
     let mut total_records: usize = 0;
+    let mut new_fields: Vec<StructField> = Vec::new();
+
+    // Determine which schema to use for parsing
+    let parsing_schema: Arc<deltalake::arrow::datatypes::Schema> = if config.schema_evolution {
+        // Sample schema from first file to detect new fields
+        if let Some(first_file) = files.first() {
+            let file_path = first_file.location.as_ref();
+            let is_compressed = is_gzip_compressed(file_path);
+
+            match sample_schema_from_file(
+                object_store,
+                &first_file.location,
+                is_compressed,
+                config.schema_sample_bytes,
+            )
+            .await
+            {
+                Ok(file_schema) => {
+                    let table_schema = table.snapshot()?.schema();
+                    if needs_evolution(&table_schema, &file_schema) {
+                        new_fields = merge_schemas(&table_schema, &file_schema);
+                        let merged = create_merged_arrow_schema(arrow_schema, &file_schema);
+                        info!(
+                            "Schema evolution detected: {} new fields from {}",
+                            new_fields.len(),
+                            file_path
+                        );
+                        Arc::new(merged)
+                    } else {
+                        Arc::clone(arrow_schema)
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to sample schema from {}: {:?}, using table schema",
+                        file_path, e
+                    );
+                    Arc::clone(arrow_schema)
+                }
+            }
+        } else {
+            Arc::clone(arrow_schema)
+        }
+    } else {
+        Arc::clone(arrow_schema)
+    };
 
     // Stream file downloads and parse results as they complete
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
             let store = Arc::clone(object_store);
-            let schema = Arc::clone(arrow_schema);
+            let schema = Arc::clone(&parsing_schema);
             let location = obj.location.clone();
             let size = obj.size;
             let batch_size = config.batch_size;
@@ -245,7 +299,14 @@ async fn process_file_batch(
     // Commit all batches in a single transaction
     if !all_batches.is_empty() {
         let batch_iter = all_batches.into_iter().map(Ok);
-        let updated_table = oxbow::write::append_batches(table.clone(), batch_iter).await?;
+
+        let updated_table = if !new_fields.is_empty() {
+            // Commit with schema evolution
+            commit_with_schema_evolution(table.clone(), batch_iter, &new_fields).await?
+        } else {
+            // Standard commit without schema changes
+            oxbow::write::append_batches(table.clone(), batch_iter).await?
+        };
         *table = updated_table;
 
         // Save state for all processed files
@@ -253,12 +314,69 @@ async fn process_file_batch(
         save_state(&config.state_file_uri, state).await?;
 
         info!(
-            "Committed {} files ({} records) to Delta v{:?}",
+            "Committed {} files ({} records) to Delta v{:?}{}",
             files_processed,
             total_records,
-            table.version()
+            table.version(),
+            if !new_fields.is_empty() {
+                format!(" (schema evolved with {} new fields)", new_fields.len())
+            } else {
+                String::new()
+            }
         );
     }
 
     Ok(files_processed)
+}
+
+/// Commit record batches with schema evolution in an atomic transaction
+async fn commit_with_schema_evolution(
+    mut table: deltalake::DeltaTable,
+    batches: impl IntoIterator<
+        Item = Result<deltalake::arrow::array::RecordBatch, deltalake::arrow::error::ArrowError>,
+    >,
+    new_fields: &[deltalake::kernel::StructField],
+) -> Result<deltalake::DeltaTable, anyhow::Error> {
+    use deltalake::kernel::transaction::CommitBuilder;
+    use deltalake::protocol::DeltaOperation;
+    use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
+
+    // Create metadata action for schema evolution
+    let metadata_action = create_metadata_action(&table, new_fields)?;
+
+    // Write data files using RecordBatchWriter
+    let mut writer = RecordBatchWriter::for_table(&table)?
+        .with_commit_properties(oxbow::default_commit_properties());
+
+    for batch in batches {
+        let batch = batch?;
+        writer.write(batch).await?;
+    }
+
+    // Flush to get add actions without committing
+    let add_actions = writer.flush().await?;
+
+    // Combine metadata + add actions in single atomic commit
+    let mut all_actions = vec![metadata_action];
+    all_actions.extend(add_actions.into_iter().map(deltalake::kernel::Action::Add));
+
+    let snapshot = table.snapshot()?;
+    let commit = CommitBuilder::from(oxbow::default_commit_properties())
+        .with_actions(all_actions)
+        .build(
+            Some(snapshot),
+            table.log_store(),
+            DeltaOperation::Write {
+                mode: deltalake::protocol::SaveMode::Append,
+                partition_by: None,
+                predicate: None,
+            },
+        );
+
+    let post_commit = commit.await?;
+
+    // Reload table with new version
+    table.load_version(post_commit.version()).await?;
+
+    Ok(table)
 }

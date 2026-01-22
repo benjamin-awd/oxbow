@@ -209,7 +209,7 @@ pub async fn create_table_with(
 }
 
 /// Return the common default [CommitProperties] to be used by issuing commits in oxbow
-pub(crate) fn default_commit_properties() -> CommitProperties {
+pub fn default_commit_properties() -> CommitProperties {
     CommitProperties::default()
         // Turn off cleanup of expired logs. After each commit, versions are
         // scanned (ListObject on s3) to clean up expired entries. This creates
@@ -440,7 +440,10 @@ async fn load_parquet_metadata(
     Ok(metadata.clone())
 }
 
-fn coerce_field(
+/// Coerce Arrow field types to Delta-compatible types.
+/// Converts timestamp precisions (ns/ms) to microseconds for Delta compatibility.
+/// Recursively handles structs and lists.
+pub fn coerce_field(
     field: deltalake::arrow::datatypes::FieldRef,
 ) -> deltalake::arrow::datatypes::FieldRef {
     use deltalake::arrow::datatypes::*;

@@ -29,9 +29,9 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 
 oxbow = { path = "../../crates/oxbow" }
+flate2 = "1"
 
 [dev-dependencies]
-flate2 = "1"
 
 [[bench]]
 name = "throughput"

@@ -1,12 +1,15 @@
 use async_compression::tokio::bufread::GzipDecoder;
 use deltalake::ObjectStore;
 use deltalake::arrow::array::RecordBatch;
+use deltalake::arrow::datatypes::Schema as ArrowSchema;
 use deltalake::arrow::json::reader::{Decoder, ReaderBuilder};
 use futures::TryStreamExt;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 use tracing::log::*;
+
+use crate::schema::infer_schema_from_json_sample;
 
 /// Stream and parse a file from GCS with lazy reading
 /// - Uses object_store's streaming API (bytes fetched on demand)
@@ -43,6 +46,41 @@ pub async fn stream_and_parse_file(
 
     let total_records: usize = batches.iter().map(|b| b.num_rows()).sum();
     Ok((batches, total_records))
+}
+
+/// Sample schema from a JSON file by reading and inferring from the first N bytes
+///
+/// This avoids reading the entire file when we only need to detect schema changes.
+/// For compressed files, decompresses the sampled bytes before inference.
+pub async fn sample_schema_from_file(
+    store: &Arc<dyn ObjectStore>,
+    path: &deltalake::Path,
+    is_compressed: bool,
+    sample_bytes: usize,
+) -> Result<ArrowSchema, anyhow::Error> {
+    // Get file as a stream of bytes
+    let get_result = store.get(path).await?;
+    let byte_stream = get_result
+        .into_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    let stream_reader = StreamReader::new(byte_stream);
+
+    // Read only the first sample_bytes
+    let sample = if is_compressed {
+        let mut buf_reader = BufReader::new(GzipDecoder::new(BufReader::new(stream_reader)));
+        let mut decompressed = vec![0u8; sample_bytes];
+        let bytes_read = buf_reader.read(&mut decompressed).await?;
+        decompressed.truncate(bytes_read);
+        decompressed
+    } else {
+        let mut buf_reader = BufReader::new(stream_reader);
+        let mut buffer = vec![0u8; sample_bytes];
+        let bytes_read = buf_reader.read(&mut buffer).await?;
+        buffer.truncate(bytes_read);
+        buffer
+    };
+
+    infer_schema_from_json_sample(&sample)
 }
 
 /// Deserialize bytes from an async reader into RecordBatches

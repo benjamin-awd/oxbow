@@ -9,6 +9,8 @@ pub struct Config {
     pub poll_interval: u64,
     pub download_concurrency: usize,
     pub batch_size: usize,
+    pub schema_evolution: bool,
+    pub schema_sample_bytes: usize,
 }
 
 /// Parse an environment variable with a default, logging any parse errors
@@ -44,6 +46,8 @@ impl Config {
             poll_interval: parse_env_or("POLL_INTERVAL_SECS", 10),
             download_concurrency: parse_env_or("DOWNLOAD_CONCURRENCY", 50),
             batch_size: parse_env_or("BATCH_SIZE", 4096),
+            schema_evolution: std::env::var("SCHEMA_EVOLUTION").is_ok(),
+            schema_sample_bytes: parse_env_or("SCHEMA_SAMPLE_BYTES", 64 * 1024),
         }
     }
 }
