@@ -18,11 +18,11 @@
 /// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
 mod config;
+mod health;
 mod read;
 mod schema;
 mod state;
 
-use axum::{Router, routing::get};
 use deltalake::ObjectStore;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -65,32 +65,28 @@ async fn main() -> Result<(), anyhow::Error> {
         config.file_timeout_secs,
         config.max_file_retries,
         config.state_retention_days,
-        if config.archive_prefix.is_empty() { "(disabled)" } else { &config.archive_prefix }
+        if config.archive_prefix.is_empty() {
+            "(disabled)"
+        } else {
+            &config.archive_prefix
+        }
     );
 
-    // Start health check server
+    // Start health check server with heartbeat tracking
+    // Consider unhealthy if no heartbeat for 5 minutes
+    let heartbeat = health::Heartbeat::new(300);
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
-    tokio::spawn(async move {
-        let app = Router::new().route("/health", get(|| async { "ok" }));
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind health server to {addr}: {e}");
-                return;
-            }
-        };
-        info!("Health server listening on {addr}");
-        if let Err(e) = axum::serve(listener, app).await {
-            error!("Health server error: {e}");
-        }
-    });
+    health::spawn_health_server(addr, heartbeat.clone());
 
     // Main polling loop
     loop {
         if let Err(e) = poll_and_process(&config).await {
             error!("Error during poll cycle: {:?}", e);
         }
+
+        // Update heartbeat after each cycle (even if poll had errors, the loop is still running)
+        heartbeat.touch();
 
         tokio::time::sleep(Duration::from_secs(config.poll_interval)).await;
     }
@@ -344,7 +340,9 @@ async fn process_file_batch(
         *table = updated_table;
 
         // Save state for all processed files
-        state.processed_files.extend(processed_paths.iter().cloned());
+        state
+            .processed_files
+            .extend(processed_paths.iter().cloned());
         save_state(&config.state_file_uri, state).await?;
 
         info!(
@@ -363,8 +361,13 @@ async fn process_file_batch(
         if !config.archive_prefix.is_empty() {
             let mut archived = 0;
             for path in &processed_paths {
-                match archive_file(object_store, path, &config.source_prefix, &config.archive_prefix)
-                    .await
+                match archive_file(
+                    object_store,
+                    path,
+                    &config.source_prefix,
+                    &config.archive_prefix,
+                )
+                .await
                 {
                     Ok(()) => archived += 1,
                     Err(e) => {
@@ -442,11 +445,7 @@ async fn archive_file(
 ) -> Result<(), anyhow::Error> {
     // Compute archive path by replacing source prefix with archive prefix
     let archive_path = if source_path.starts_with(source_prefix) {
-        format!(
-            "{}{}",
-            archive_prefix,
-            &source_path[source_prefix.len()..]
-        )
+        format!("{}{}", archive_prefix, &source_path[source_prefix.len()..])
     } else {
         format!("{}{}", archive_prefix, source_path)
     };
