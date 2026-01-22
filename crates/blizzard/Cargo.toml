@@ -1,5 +1,5 @@
 [package]
-name = "file-loader-cloudrun"
+name = "blizzard"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ description = "Cloud Run service for polling and loading JSONL files into Delta 
 license-file.workspace = true
 
 [[bin]]
-name = "file-loader-cloudrun"
+name = "blizzard"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,7 +28,7 @@ parquet = { version = "57.2.0", features = ["async", "object_store"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 
-oxbow = { path = "../../crates/oxbow" }
+oxbow = { path = "../oxbow" }
 flate2 = "1"
 
 [dev-dependencies]
