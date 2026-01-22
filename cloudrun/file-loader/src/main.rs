@@ -19,7 +19,6 @@
 mod config;
 mod read;
 mod state;
-mod write;
 
 use axum::{Router, routing::get};
 use deltalake::ObjectStore;
@@ -31,8 +30,7 @@ use url::Url;
 
 use config::Config;
 use read::{is_gzip_compressed, is_supported_json_file, stream_and_parse_file};
-use state::{ProcessedState, load_state};
-use write::{BatchBufferingWriter, COMMIT_RECORD_THRESHOLD, commit_to_delta};
+use state::{ProcessedState, load_state, save_state};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -188,7 +186,7 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Process a batch of files with streaming writes and rolling commits
+/// Process a batch of files and append to Delta table
 async fn process_file_batch(
     files: &[deltalake::ObjectMeta],
     object_store: &Arc<dyn ObjectStore>,
@@ -197,13 +195,8 @@ async fn process_file_batch(
     state: &mut ProcessedState,
     config: &Config,
 ) -> Result<usize, anyhow::Error> {
-    let table_store = table.object_store();
-
-    // Create initial buffering writer
-    let mut writer =
-        BatchBufferingWriter::new(Arc::clone(&table_store), Arc::clone(arrow_schema)).await?;
-    let mut pending_paths: Vec<String> = Vec::new(); // Paths waiting for next commit
-    let mut files_processed: usize = 0;
+    let mut all_batches: Vec<deltalake::arrow::array::RecordBatch> = Vec::new();
+    let mut processed_paths: Vec<String> = Vec::new();
     let mut total_records: usize = 0;
 
     // Stream file downloads and parse results as they complete
@@ -223,7 +216,6 @@ async fn process_file_batch(
                     file_path, size, is_compressed
                 );
 
-                // Stream from GCS using object_store
                 let result =
                     stream_and_parse_file(&store, &location, schema, is_compressed, batch_size)
                         .await;
@@ -232,48 +224,14 @@ async fn process_file_batch(
         })
         .buffer_unordered(config.download_concurrency);
 
-    // Process results as they arrive (streaming, not collecting)
+    // Collect batches from all files
     while let Some((file_path, result)) = stream.next().await {
         match result {
             Ok((batches, records)) => {
                 info!("Parsed {} records from {}", records, file_path);
-
-                // Write batches to parquet as they arrive
-                for batch in batches {
-                    writer.write(&batch).await?;
-                }
-
-                pending_paths.push(file_path);
-                files_processed += 1;
+                all_batches.extend(batches);
+                processed_paths.push(file_path);
                 total_records += records;
-
-                // Rolling commit: flush and commit when we hit the record threshold
-                if writer.records() >= COMMIT_RECORD_THRESHOLD {
-                    let records_in_file = writer.records();
-                    let file_meta = writer.close().await?;
-
-                    // Commit immediately (Arroyo-style)
-                    let version = commit_to_delta(
-                        file_meta.clone(),
-                        table,
-                        state,
-                        &mut pending_paths,
-                        &config.state_file_uri,
-                    )
-                    .await?;
-
-                    info!(
-                        "Committed parquet file {} ({} bytes, {} records) to Delta v{}",
-                        file_meta.location, file_meta.size, records_in_file, version
-                    );
-
-                    // Start a new writer for the next batch of records
-                    writer = BatchBufferingWriter::new(
-                        Arc::clone(&table_store),
-                        Arc::clone(arrow_schema),
-                    )
-                    .await?;
-                }
             }
             Err(e) => {
                 error!("Failed to process {}: {:?}", file_path, e);
@@ -281,30 +239,23 @@ async fn process_file_batch(
         }
     }
 
-    // Close and commit final writer if it has any records
-    if writer.records() > 0 {
-        let records_in_file = writer.records();
-        let file_meta = writer.close().await?;
+    let files_processed = processed_paths.len();
 
-        let version = commit_to_delta(
-            file_meta.clone(),
-            table,
-            state,
-            &mut pending_paths,
-            &config.state_file_uri,
-        )
-        .await?;
+    // Commit all batches in a single transaction
+    if !all_batches.is_empty() {
+        let batch_iter = all_batches.into_iter().map(Ok);
+        let updated_table = oxbow::write::append_batches(table.clone(), batch_iter).await?;
+        *table = updated_table;
+
+        // Save state for all processed files
+        state.processed_files.extend(processed_paths);
+        save_state(&config.state_file_uri, state).await?;
 
         info!(
-            "Committed final parquet file {} ({} bytes, {} records) to Delta v{}",
-            file_meta.location, file_meta.size, records_in_file, version
-        );
-    }
-
-    if files_processed > 0 {
-        info!(
-            "Batch complete: {} files, {} total records",
-            files_processed, total_records
+            "Committed {} files ({} records) to Delta v{:?}",
+            files_processed,
+            total_records,
+            table.version()
         );
     }
 
