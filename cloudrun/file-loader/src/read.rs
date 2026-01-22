@@ -1,7 +1,7 @@
 use async_compression::tokio::bufread::GzipDecoder;
+use deltalake::ObjectStore;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::arrow::json::reader::{Decoder, ReaderBuilder};
-use deltalake::ObjectStore;
 use futures::TryStreamExt;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -95,20 +95,29 @@ async fn deserialize_stream(
     Ok(batches)
 }
 
+/// Case-insensitive check if string ends with suffix
+fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
 /// Check if a filename is a supported JSON file format
 pub fn is_supported_json_file(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.ends_with(".json")
-        || lower.ends_with(".jsonl")
-        || lower.ends_with(".ndjson")
-        || lower.ends_with(".json.gz")
-        || lower.ends_with(".jsonl.gz")
-        || lower.ends_with(".ndjson.gz")
+    const EXTENSIONS: &[&str] = &[
+        ".json",
+        ".jsonl",
+        ".ndjson",
+        ".json.gz",
+        ".jsonl.gz",
+        ".ndjson.gz",
+    ];
+    EXTENSIONS
+        .iter()
+        .any(|ext| ends_with_ignore_case(name, ext))
 }
 
 /// Check if a file is gzip compressed based on extension
 pub fn is_gzip_compressed(name: &str) -> bool {
-    name.to_lowercase().ends_with(".gz")
+    ends_with_ignore_case(name, ".gz")
 }
 
 #[cfg(test)]

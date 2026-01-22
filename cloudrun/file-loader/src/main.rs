@@ -21,7 +21,7 @@ mod read;
 mod state;
 mod write;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use deltalake::ObjectStore;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -31,8 +31,8 @@ use url::Url;
 
 use config::Config;
 use read::{is_gzip_compressed, is_supported_json_file, stream_and_parse_file};
-use state::{load_state, ProcessedState};
-use write::{commit_to_delta, BatchBufferingWriter, COMMIT_RECORD_THRESHOLD};
+use state::{ProcessedState, load_state};
+use write::{BatchBufferingWriter, COMMIT_RECORD_THRESHOLD, commit_to_delta};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -50,18 +50,31 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!(
         "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}",
-        config.source_bucket, config.source_prefix, config.delta_table_uri,
-        config.state_file_uri, config.poll_interval, config.download_concurrency, config.batch_size
+        config.source_bucket,
+        config.source_prefix,
+        config.delta_table_uri,
+        config.state_file_uri,
+        config.poll_interval,
+        config.download_concurrency,
+        config.batch_size
     );
 
     // Start health check server in background (Cloud Run requires HTTP responsiveness)
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("0.0.0.0:{port}");
     tokio::spawn(async move {
         let app = Router::new().route("/health", get(|| async { "ok" }));
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        info!("Health server listening on {}", addr);
-        axum::serve(listener, app).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind health server to {addr}: {e}");
+                return;
+            }
+        };
+        info!("Health server listening on {addr}");
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("Health server error: {e}");
+        }
     });
 
     // Main polling loop
@@ -76,7 +89,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
 /// Poll for new files and process them in batches
 async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
-    use deltalake::logstore::{logstore_for, StorageConfig};
+    use deltalake::logstore::{StorageConfig, logstore_for};
 
     const FILE_BATCH_SIZE: usize = 100; // Process 100 files per batch
 
@@ -94,11 +107,8 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     let mut state = load_state(&config.state_file_uri).await?;
 
     // List objects with prefix, filtering as we go
-    let list_prefix = if config.source_prefix.is_empty() {
-        None
-    } else {
-        Some(deltalake::Path::from(config.source_prefix.as_str()))
-    };
+    let list_prefix = (!config.source_prefix.is_empty())
+        .then(|| deltalake::Path::from(config.source_prefix.as_str()));
 
     // Stream the listing and filter to new files only
     let mut listing = object_store.list(list_prefix.as_ref());
@@ -190,7 +200,8 @@ async fn process_file_batch(
     let table_store = table.object_store();
 
     // Create initial buffering writer
-    let mut writer = BatchBufferingWriter::new(table_store.clone(), arrow_schema.clone()).await?;
+    let mut writer =
+        BatchBufferingWriter::new(Arc::clone(&table_store), Arc::clone(arrow_schema)).await?;
     let mut pending_paths: Vec<String> = Vec::new(); // Paths waiting for next commit
     let mut files_processed: usize = 0;
     let mut total_records: usize = 0;
@@ -198,8 +209,8 @@ async fn process_file_batch(
     // Stream file downloads and parse results as they complete
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
-            let store = object_store.clone();
-            let schema = arrow_schema.clone();
+            let store = Arc::clone(object_store);
+            let schema = Arc::clone(arrow_schema);
             let location = obj.location.clone();
             let size = obj.size;
             let batch_size = config.batch_size;
@@ -239,7 +250,7 @@ async fn process_file_batch(
                 // Rolling commit: flush and commit when we hit the record threshold
                 if writer.records() >= COMMIT_RECORD_THRESHOLD {
                     let records_in_file = writer.records();
-                    let file_meta = writer.close(&table_store).await?;
+                    let file_meta = writer.close().await?;
 
                     // Commit immediately (Arroyo-style)
                     let version = commit_to_delta(
@@ -257,9 +268,11 @@ async fn process_file_batch(
                     );
 
                     // Start a new writer for the next batch of records
-                    writer =
-                        BatchBufferingWriter::new(table_store.clone(), arrow_schema.clone())
-                            .await?;
+                    writer = BatchBufferingWriter::new(
+                        Arc::clone(&table_store),
+                        Arc::clone(arrow_schema),
+                    )
+                    .await?;
                 }
             }
             Err(e) => {
@@ -271,7 +284,7 @@ async fn process_file_batch(
     // Close and commit final writer if it has any records
     if writer.records() > 0 {
         let records_in_file = writer.records();
-        let file_meta = writer.close(&table_store).await?;
+        let file_meta = writer.close().await?;
 
         let version = commit_to_delta(
             file_meta.clone(),

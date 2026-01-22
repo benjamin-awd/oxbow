@@ -31,8 +31,8 @@ fn generate_jsonl_data(num_records: usize) -> Vec<u8> {
 
 /// Generate gzip-compressed JSONL data
 fn generate_gzip_jsonl_data(num_records: usize) -> Vec<u8> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
 
     let raw = generate_jsonl_data(num_records);
@@ -268,10 +268,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Summary table
     println!("========== SUMMARY ==========");
-    println!(
-        "{:<40} {:>15} {:>12}",
-        "Scenario", "Records/sec", "MB/sec"
-    );
+    println!("{:<40} {:>15} {:>12}", "Scenario", "Records/sec", "MB/sec");
     println!("{:-<40} {:->15} {:->12}", "", "", "");
     for result in &results {
         println!(

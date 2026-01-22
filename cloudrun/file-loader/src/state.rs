@@ -13,7 +13,7 @@ pub struct ProcessedState {
 
 /// Load processed state from GCS
 pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::Error> {
-    use deltalake::logstore::{logstore_for, StorageConfig};
+    use deltalake::logstore::{StorageConfig, logstore_for};
 
     let url = Url::parse(state_file_uri)?;
     let store = logstore_for(&url, StorageConfig::default())?;
@@ -39,7 +39,7 @@ pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState, anyhow::
 
 /// Save processed state to GCS
 pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<(), anyhow::Error> {
-    use deltalake::logstore::{logstore_for, StorageConfig};
+    use deltalake::logstore::{StorageConfig, logstore_for};
 
     let url = Url::parse(state_file_uri)?;
     let store = logstore_for(&url, StorageConfig::default())?;

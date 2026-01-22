@@ -1,4 +1,4 @@
-use crate::state::{save_state, ProcessedState};
+use crate::state::{ProcessedState, save_state};
 use deltalake::arrow::array::RecordBatch;
 use deltalake::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use deltalake::parquet::basic::Compression;
@@ -13,6 +13,7 @@ pub const COMMIT_RECORD_THRESHOLD: usize = 500_000; // Commit every 500k records
 /// Buffering writer that accumulates batches and commits based on rolling policy
 pub struct BatchBufferingWriter {
     writer: AsyncArrowWriter<ParquetObjectWriter>,
+    object_store: Arc<dyn ObjectStore>,
     path: deltalake::Path,
     records_written: usize,
 }
@@ -23,10 +24,10 @@ impl BatchBufferingWriter {
         schema: Arc<deltalake::arrow::datatypes::Schema>,
     ) -> Result<Self, anyhow::Error> {
         let uuid = Uuid::new_v4();
-        let filename = format!("part-{}.snappy.parquet", uuid);
+        let filename = format!("part-{uuid}.snappy.parquet");
         let path = deltalake::Path::from(filename);
 
-        let sink = ParquetObjectWriter::new(object_store, path.clone());
+        let sink = ParquetObjectWriter::new(Arc::clone(&object_store), path.clone());
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
@@ -35,6 +36,7 @@ impl BatchBufferingWriter {
 
         Ok(Self {
             writer,
+            object_store,
             path,
             records_written: 0,
         })
@@ -46,9 +48,9 @@ impl BatchBufferingWriter {
         Ok(())
     }
 
-    pub async fn close(self, object_store: &Arc<dyn ObjectStore>) -> Result<ObjectMeta, anyhow::Error> {
+    pub async fn close(self) -> Result<ObjectMeta, anyhow::Error> {
         self.writer.close().await?;
-        let meta = object_store.head(&self.path).await?;
+        let meta = self.object_store.head(&self.path).await?;
         Ok(ObjectMeta {
             location: self.path,
             last_modified: meta.last_modified,
@@ -78,9 +80,7 @@ pub async fn commit_to_delta(
     table.load().await?;
 
     // Mark files as processed and save state
-    for path in pending_paths.drain(..) {
-        state.processed_files.insert(path);
-    }
+    state.processed_files.extend(pending_paths.drain(..));
     save_state(state_file_uri, state).await?;
 
     Ok(version)
