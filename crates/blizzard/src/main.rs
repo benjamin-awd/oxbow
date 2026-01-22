@@ -443,8 +443,8 @@ async fn archive_file(
     source_prefix: &str,
     archive_prefix: &str,
 ) -> Result<()> {
-    let archive_path = if source_path.starts_with(source_prefix) {
-        format!("{}{}", archive_prefix, &source_path[source_prefix.len()..])
+    let archive_path = if let Some(stripped) = source_path.strip_prefix(source_prefix) {
+        format!("{}{}", archive_prefix, stripped)
     } else {
         format!("{}{}", archive_prefix, source_path)
     };

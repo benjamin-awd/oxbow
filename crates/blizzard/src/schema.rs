@@ -85,7 +85,7 @@ pub fn create_metadata_action(table: &DeltaTable, new_fields: &[StructField]) ->
     all_fields.extend(new_fields.iter().cloned());
 
     let new_schema = Schema::try_new(all_fields)
-        .map_err(|e| deltalake::DeltaTableError::from(e))
+        .map_err(deltalake::DeltaTableError::from)
         .context(DeltaTableSnafu)?;
 
     let mut action = models::new_metadata(
@@ -93,19 +93,19 @@ pub fn create_metadata_action(table: &DeltaTable, new_fields: &[StructField]) ->
         table_metadata.partition_columns().clone(),
         table_metadata.configuration().clone(),
     )
-    .map_err(|e| deltalake::DeltaTableError::from(e))
+    .map_err(deltalake::DeltaTableError::from)
     .context(DeltaTableSnafu)?;
 
     if let Some(name) = table_metadata.name() {
         action = action
             .with_name(name.into())
-            .map_err(|e| deltalake::DeltaTableError::from(e))
+            .map_err(deltalake::DeltaTableError::from)
             .context(DeltaTableSnafu)?;
     }
     if let Some(description) = table_metadata.description() {
         action = action
             .with_description(description.into())
-            .map_err(|e| deltalake::DeltaTableError::from(e))
+            .map_err(deltalake::DeltaTableError::from)
             .context(DeltaTableSnafu)?;
     }
 

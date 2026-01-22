@@ -26,7 +26,7 @@ pub async fn stream_and_parse_file(
 
     let byte_stream = get_result
         .into_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(std::io::Error::other);
     let stream_reader = StreamReader::new(byte_stream);
 
     let mut decoder = ReaderBuilder::new(arrow_schema)
@@ -62,7 +62,7 @@ pub async fn sample_schema_from_file(
         .map_err(|e| ObjectStoreError::from_source(e, path.as_ref()))?;
     let byte_stream = get_result
         .into_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        .map_err(std::io::Error::other);
     let stream_reader = StreamReader::new(byte_stream);
 
     let sample = if is_compressed {
@@ -93,11 +93,10 @@ async fn deserialize_stream(
 
         if buf.is_empty() {
             // End of stream - flush any remaining data
-            if let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)? {
-                if batch.num_rows() > 0 {
+            if let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)?
+                && batch.num_rows() > 0 {
                     batches.push(batch);
                 }
-            }
             break;
         }
 
@@ -127,11 +126,10 @@ async fn deserialize_stream(
         reader.consume(have_read);
 
         // Flush when decoder has complete records
-        if !decoder.has_partial_record() {
-            if let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)? {
+        if !decoder.has_partial_record()
+            && let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)? {
                 batches.push(batch);
             }
-        }
     }
 
     Ok(batches)
