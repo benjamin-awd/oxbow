@@ -91,6 +91,16 @@ pub enum Error {
 
     #[snafu(display("Operation timed out after {duration_secs}s"))]
     Timeout { duration_secs: u64 },
+
+    #[snafu(display("Arrow error: {source}"))]
+    Arrow {
+        source: deltalake::arrow::error::ArrowError,
+    },
+
+    #[snafu(display("DataFusion error: {source}"))]
+    DataFusion {
+        source: deltalake::datafusion::error::DataFusionError,
+    },
 }
 
 impl Error {
@@ -111,7 +121,8 @@ impl Error {
                 source: ObjectStoreError::PermissionDenied { .. }
             } | Self::Parsing {
                 source: ParsingError::DecoderStuck { .. }
-            }
+            } | Self::Arrow { .. }
+                | Self::DataFusion { .. }
         )
     }
 }
@@ -124,6 +135,8 @@ pub enum ErrorCategory {
     Io,
     Configuration,
     Timeout,
+    Arrow,
+    DataFusion,
 }
 
 impl From<&Error> for ErrorCategory {
@@ -135,6 +148,8 @@ impl From<&Error> for ErrorCategory {
             Error::Io { .. } => Self::Io,
             Error::Config { .. } => Self::Configuration,
             Error::Timeout { .. } => Self::Timeout,
+            Error::Arrow { .. } => Self::Arrow,
+            Error::DataFusion { .. } => Self::DataFusion,
         }
     }
 }

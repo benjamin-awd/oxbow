@@ -8,7 +8,7 @@ use deltalake::arrow::datatypes::{Field, Schema as ArrowSchema};
 use deltalake::arrow::json::reader::infer_json_schema_from_seekable;
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::kernel::models;
-use deltalake::kernel::schema::{Schema, StructField};
+use deltalake::kernel::schema::{DataType, Schema, StructField};
 use deltalake::kernel::{Action, MetadataExt};
 use snafu::ResultExt;
 use std::io::Cursor;
@@ -16,6 +16,14 @@ use std::sync::Arc;
 use tracing::log::*;
 
 use crate::error::{DeltaTableSnafu, Result, SchemaInferenceSnafu};
+
+/// Column name for tracking source file origin
+pub const SOURCE_FILE_COLUMN: &str = "_source_file";
+
+/// Creates a StructField for the source file column
+pub fn source_file_field() -> StructField {
+    StructField::new(SOURCE_FILE_COLUMN.to_string(), DataType::STRING, false)
+}
 
 pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema> {
     let cursor = Cursor::new(sample);

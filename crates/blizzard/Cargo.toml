@@ -7,6 +7,10 @@ homepage.workspace = true
 description = "Cloud Run service for polling and loading JSONL files into Delta tables on GCS"
 license-file.workspace = true
 
+[lib]
+name = "blizzard"
+path = "src/lib.rs"
+
 [[bin]]
 name = "blizzard"
 path = "src/main.rs"
@@ -15,7 +19,7 @@ path = "src/main.rs"
 snafu = "0.8"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 axum = "0.8"
-deltalake = { workspace = true }
+deltalake = { workspace = true, features = ["datafusion"] }
 futures = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
@@ -32,6 +36,7 @@ oxbow = { path = "../oxbow" }
 flate2 = "1"
 
 [dev-dependencies]
+tempfile = "3"
 
 [[bench]]
 name = "throughput"

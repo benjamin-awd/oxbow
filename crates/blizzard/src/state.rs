@@ -1,13 +1,18 @@
+use deltalake::DeltaTable;
+use deltalake::arrow::array::Array;
+use deltalake::datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::log::*;
 use url::Url;
 
 use crate::error::{
-    DeltaTableSnafu, Error, ErrorCategory, ObjectStoreError, Result, StateSerializationSnafu,
-    UrlParseSnafu,
+    DataFusionSnafu, DeltaTableSnafu, Error, ErrorCategory, ObjectStoreError, Result,
+    StateSerializationSnafu, UrlParseSnafu,
 };
+use crate::schema::SOURCE_FILE_COLUMN;
 
 /// Tracks failure information for a file
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,11 +29,9 @@ pub struct FileFailure {
     pub is_transient: Option<bool>,
 }
 
-/// State file tracking which files have been processed
+/// State file tracking file failures (processed files are tracked in Delta via _source_file column)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProcessedState {
-    #[serde(default)]
-    pub processed_files: HashSet<String>,
     /// Files that have failed processing with their retry counts
     #[serde(default)]
     pub failed_files: HashMap<String, FileFailure>,
@@ -85,10 +88,62 @@ impl ProcessedState {
         self.failed_files.remove(path);
     }
 
-    /// Check if a file should be skipped (already processed or permanently failed)
-    pub fn should_skip(&self, path: &str) -> bool {
-        self.processed_files.contains(path) || self.permanently_failed.contains(path)
+    /// Check if a file should be skipped due to permanent failure
+    /// Note: Successfully processed files are tracked via Delta's _source_file column
+    pub fn is_permanently_failed(&self, path: &str) -> bool {
+        self.permanently_failed.contains(path)
     }
+}
+
+/// Query the Delta table to get all previously processed source files
+///
+/// Uses DataFusion to execute `SELECT DISTINCT _source_file FROM table`.
+/// Returns an empty set if the column doesn't exist (table hasn't been migrated yet).
+pub async fn query_processed_files(table: &DeltaTable) -> Result<HashSet<String>> {
+    let ctx = SessionContext::new();
+    ctx.register_table("source_table", Arc::new(table.clone()))
+        .context(DataFusionSnafu)?;
+
+    // Check if the _source_file column exists in the schema
+    let schema = table.snapshot().context(DeltaTableSnafu)?.schema();
+    if schema.index_of(SOURCE_FILE_COLUMN).is_none() {
+        debug!(
+            "Column {} not found in table schema, returning empty set",
+            SOURCE_FILE_COLUMN
+        );
+        return Ok(HashSet::new());
+    }
+
+    let df = ctx
+        .sql(&format!(
+            "SELECT DISTINCT {} FROM source_table",
+            SOURCE_FILE_COLUMN
+        ))
+        .await
+        .context(DataFusionSnafu)?;
+
+    let batches = df.collect().await.context(DataFusionSnafu)?;
+
+    let mut processed_files = HashSet::new();
+    for batch in batches {
+        if let Some(array) = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::StringArray>()
+        {
+            for i in 0..array.len() {
+                if !array.is_null(i) {
+                    processed_files.insert(array.value(i).to_string());
+                }
+            }
+        }
+    }
+
+    debug!(
+        "Found {} previously processed files in Delta table",
+        processed_files.len()
+    );
+    Ok(processed_files)
 }
 
 pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState> {
@@ -109,8 +164,9 @@ pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState> {
             let state: ProcessedState =
                 serde_json::from_slice(&bytes).context(StateSerializationSnafu)?;
             debug!(
-                "Loaded state with {} processed files",
-                state.processed_files.len()
+                "Loaded state with {} failed files, {} permanently failed",
+                state.failed_files.len(),
+                state.permanently_failed.len()
             );
             Ok(state)
         }
@@ -155,13 +211,15 @@ mod tests {
     #[test]
     fn test_state_serialization() {
         let mut state = ProcessedState::default();
-        state.processed_files.insert("file1.ndjson".to_string());
-        state.processed_files.insert("file2.ndjson.gz".to_string());
+        state.permanently_failed.insert("file1.ndjson".to_string());
+        state
+            .permanently_failed
+            .insert("file2.ndjson.gz".to_string());
 
         let json = serde_json::to_string(&state).unwrap();
         let restored: ProcessedState = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(state.processed_files, restored.processed_files);
+        assert_eq!(state.permanently_failed, restored.permanently_failed);
     }
 
     #[test]
@@ -171,17 +229,17 @@ mod tests {
 
         // First failure - should retry
         assert!(state.record_failure_str("file1.json", "error 1", max_retries));
-        assert!(!state.should_skip("file1.json"));
+        assert!(!state.is_permanently_failed("file1.json"));
         assert_eq!(state.failed_files.get("file1.json").unwrap().retry_count, 1);
 
         // Second failure - should retry
         assert!(state.record_failure_str("file1.json", "error 2", max_retries));
-        assert!(!state.should_skip("file1.json"));
+        assert!(!state.is_permanently_failed("file1.json"));
         assert_eq!(state.failed_files.get("file1.json").unwrap().retry_count, 2);
 
         // Third failure - should be permanently failed
         assert!(!state.record_failure_str("file1.json", "error 3", max_retries));
-        assert!(state.should_skip("file1.json"));
+        assert!(state.is_permanently_failed("file1.json"));
         assert!(state.permanently_failed.contains("file1.json"));
         assert!(!state.failed_files.contains_key("file1.json"));
     }
@@ -200,28 +258,24 @@ mod tests {
     }
 
     #[test]
-    fn test_should_skip() {
+    fn test_is_permanently_failed() {
         let mut state = ProcessedState::default();
 
-        // New file - shouldn't skip
-        assert!(!state.should_skip("file1.json"));
+        // New file - not permanently failed
+        assert!(!state.is_permanently_failed("file1.json"));
 
-        // Processed file - should skip
-        state.processed_files.insert("file2.json".to_string());
-        assert!(state.should_skip("file2.json"));
-
-        // Permanently failed file - should skip
-        state.permanently_failed.insert("file3.json".to_string());
-        assert!(state.should_skip("file3.json"));
+        // Permanently failed file
+        state.permanently_failed.insert("file2.json".to_string());
+        assert!(state.is_permanently_failed("file2.json"));
     }
 
     #[test]
     fn test_backward_compatibility() {
-        // Old state format without new fields should still deserialize
+        // Old state format with processed_files should still deserialize (ignored)
         let old_json = r#"{"processed_files":["file1.json"]}"#;
         let state: ProcessedState = serde_json::from_str(old_json).unwrap();
 
-        assert!(state.processed_files.contains("file1.json"));
+        // processed_files is now ignored, only failure tracking matters
         assert!(state.failed_files.is_empty());
         assert!(state.permanently_failed.is_empty());
     }

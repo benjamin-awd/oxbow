@@ -1,7 +1,7 @@
 use async_compression::tokio::bufread::GzipDecoder;
 use deltalake::ObjectStore;
-use deltalake::arrow::array::RecordBatch;
-use deltalake::arrow::datatypes::Schema as ArrowSchema;
+use deltalake::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use deltalake::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use deltalake::arrow::json::reader::{Decoder, ReaderBuilder};
 use futures::TryStreamExt;
 use snafu::ResultExt;
@@ -9,8 +9,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 
-use crate::error::{IoSnafu, ObjectStoreError, ParsingError, Result, SchemaInferenceSnafu};
-use crate::schema::infer_schema_from_json_sample;
+use crate::error::{
+    ArrowSnafu, IoSnafu, ObjectStoreError, ParsingError, Result, SchemaInferenceSnafu,
+};
+use crate::schema::{SOURCE_FILE_COLUMN, infer_schema_from_json_sample};
 
 pub async fn stream_and_parse_file(
     store: &Arc<dyn ObjectStore>,
@@ -24,9 +26,7 @@ pub async fn stream_and_parse_file(
         .await
         .map_err(|e| ObjectStoreError::from_source(e, path.as_ref()))?;
 
-    let byte_stream = get_result
-        .into_stream()
-        .map_err(std::io::Error::other);
+    let byte_stream = get_result.into_stream().map_err(std::io::Error::other);
     let stream_reader = StreamReader::new(byte_stream);
 
     let mut decoder = ReaderBuilder::new(arrow_schema)
@@ -60,9 +60,7 @@ pub async fn sample_schema_from_file(
         .get(path)
         .await
         .map_err(|e| ObjectStoreError::from_source(e, path.as_ref()))?;
-    let byte_stream = get_result
-        .into_stream()
-        .map_err(std::io::Error::other);
+    let byte_stream = get_result.into_stream().map_err(std::io::Error::other);
     let stream_reader = StreamReader::new(byte_stream);
 
     let sample = if is_compressed {
@@ -82,6 +80,32 @@ pub async fn sample_schema_from_file(
     infer_schema_from_json_sample(&sample)
 }
 
+/// Augments a RecordBatch with a `_source_file` column containing the source file path
+///
+/// This allows tracking which source file each record came from, enabling atomic
+/// state tracking through the Delta table itself rather than a separate state file.
+pub fn augment_with_source_file(batch: RecordBatch, source_file: &str) -> Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+
+    // Create a StringArray filled with the source file path
+    let source_array: ArrayRef = Arc::new(StringArray::from(vec![source_file; num_rows]));
+
+    // Add the source file column to the schema
+    let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(
+        SOURCE_FILE_COLUMN,
+        ArrowDataType::Utf8,
+        false,
+    )));
+    let new_schema = Arc::new(ArrowSchema::new(fields));
+
+    // Add the source file column to the batch
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(source_array);
+
+    RecordBatch::try_new(new_schema, columns).context(ArrowSnafu)
+}
+
 async fn deserialize_stream(
     mut reader: impl tokio::io::AsyncBufRead + Unpin,
     decoder: &mut Decoder,
@@ -94,9 +118,10 @@ async fn deserialize_stream(
         if buf.is_empty() {
             // End of stream - flush any remaining data
             if let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)?
-                && batch.num_rows() > 0 {
-                    batches.push(batch);
-                }
+                && batch.num_rows() > 0
+            {
+                batches.push(batch);
+            }
             break;
         }
 
@@ -127,9 +152,10 @@ async fn deserialize_stream(
 
         // Flush when decoder has complete records
         if !decoder.has_partial_record()
-            && let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)? {
-                batches.push(batch);
-            }
+            && let Some(batch) = decoder.flush().context(SchemaInferenceSnafu)?
+        {
+            batches.push(batch);
+        }
     }
 
     Ok(batches)

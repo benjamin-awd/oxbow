@@ -17,12 +17,19 @@
 ///
 /// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
-mod config;
-mod error;
-mod health;
-mod read;
-mod schema;
-mod state;
+use blizzard::config::Config;
+use blizzard::error::{
+    DeltaTableSnafu, Error, ObjectStoreError, Result, SchemaInferenceSnafu, UrlParseSnafu,
+};
+use blizzard::health;
+use blizzard::read::{
+    augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
+    stream_and_parse_file,
+};
+use blizzard::schema::{
+    self, create_merged_arrow_schema, create_metadata_action, merge_schemas, needs_evolution,
+};
+use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
 
 use deltalake::ObjectStore;
 use futures::StreamExt;
@@ -30,16 +37,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::*;
 use url::Url;
-
-use config::Config;
-use error::{
-    DeltaTableSnafu, Error, ObjectStoreError, Result, SchemaInferenceSnafu, UrlParseSnafu,
-};
-use read::{
-    is_gzip_compressed, is_supported_json_file, sample_schema_from_file, stream_and_parse_file,
-};
-use schema::{create_merged_arrow_schema, create_metadata_action, merge_schemas, needs_evolution};
-use state::{ProcessedState, load_state, save_state};
 
 /// Prefix where processed files are moved to
 const ARCHIVE_PREFIX: &str = "processed/";
@@ -125,7 +122,7 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     let mut total_listed = 0usize;
     let mut total_processed = 0usize;
 
-    // Open delta table
+    // Open delta table and query for already-processed files
     let mut table = oxbow::lock::open_table(&config.delta_table_uri)
         .await
         .context(DeltaTableSnafu)?;
@@ -134,6 +131,17 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         .context(DeltaTableSnafu)?
         .snapshot()
         .arrow_schema();
+
+    // Query Delta table for files that have already been processed
+    // This provides atomic state tracking - if a crash occurs after Delta commit,
+    // we won't reprocess files because they're already tracked in the table
+    let delta_processed_files = query_processed_files(&table).await?;
+    if !delta_processed_files.is_empty() {
+        info!(
+            "Found {} previously processed files in Delta table",
+            delta_processed_files.len()
+        );
+    }
 
     while let Some(result) = listing.next().await {
         let obj = result.map_err(|e| {
@@ -148,7 +156,10 @@ async fn poll_and_process(config: &Config) -> Result<()> {
             continue;
         }
 
-        if is_supported_json_file(name) && !state.should_skip(name) {
+        if is_supported_json_file(name)
+            && !delta_processed_files.contains(name)
+            && !state.is_permanently_failed(name)
+        {
             new_files.push(obj);
         }
 
@@ -225,6 +236,16 @@ async fn process_file_batch(
     let mut total_records: usize = 0;
     let mut new_fields: Vec<StructField> = Vec::new();
 
+    // Check if _source_file column needs to be added to the table schema
+    let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
+    if table_schema.index_of(schema::SOURCE_FILE_COLUMN).is_none() {
+        info!(
+            "Adding {} column to table schema for atomic state tracking",
+            schema::SOURCE_FILE_COLUMN
+        );
+        new_fields.push(schema::source_file_field());
+    }
+
     let parsing_schema: Arc<deltalake::arrow::datatypes::Schema> = if config.schema_evolution {
         // Sample schema from first file to detect new fields
         if let Some(first_file) = files.first() {
@@ -242,13 +263,14 @@ async fn process_file_batch(
                 Ok(file_schema) => {
                     let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
                     if needs_evolution(&table_schema, &file_schema) {
-                        new_fields = merge_schemas(&table_schema, &file_schema);
+                        let file_new_fields = merge_schemas(&table_schema, &file_schema);
                         let merged = create_merged_arrow_schema(arrow_schema, &file_schema);
                         info!(
                             "Schema evolution detected: {} new fields from {}",
-                            new_fields.len(),
+                            file_new_fields.len(),
                             file_path
                         );
+                        new_fields.extend(file_new_fields);
                         Arc::new(merged)
                     } else {
                         Arc::clone(arrow_schema)
@@ -304,7 +326,17 @@ async fn process_file_batch(
         match result {
             Ok(Ok((batches, records))) => {
                 info!("Parsed {} records from {}", records, file_path);
-                all_batches.extend(batches);
+                // Augment each batch with the source file column for atomic state tracking
+                for batch in batches {
+                    match augment_with_source_file(batch, &file_path) {
+                        Ok(augmented) => all_batches.push(augmented),
+                        Err(e) => {
+                            error!("Failed to augment batch with source file: {:?}", e);
+                            state.record_failure(&file_path, &e, max_retries);
+                            continue;
+                        }
+                    }
+                }
                 state.clear_failure(&file_path);
                 processed_paths.push(file_path);
                 total_records += records;
@@ -336,9 +368,7 @@ async fn process_file_batch(
         };
         *table = updated_table;
 
-        state
-            .processed_files
-            .extend(processed_paths.iter().cloned());
+        // Save state file for failure tracking (processed files are now tracked in Delta)
         save_state(&config.state_file_uri, state).await?;
 
         info!(
