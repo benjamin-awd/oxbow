@@ -52,7 +52,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
+        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}, state_retention_days={}, archive_prefix={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
@@ -63,7 +63,9 @@ async fn main() -> Result<(), anyhow::Error> {
         config.schema_evolution,
         config.schema_sample_bytes,
         config.file_timeout_secs,
-        config.max_file_retries
+        config.max_file_retries,
+        config.state_retention_days,
+        if config.archive_prefix.is_empty() { "(disabled)" } else { &config.archive_prefix }
     );
 
     // Start health check server
@@ -113,6 +115,16 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
     // Load current state
     let mut state = load_state(&config.state_file_uri).await?;
 
+    // Prune old entries from state
+    let prune_stats = state.prune_old_entries(config.state_retention_days);
+    if prune_stats.processed_pruned > 0 || prune_stats.failed_pruned > 0 {
+        info!(
+            "Pruned state: {} processed entries, {} failed entries (retention: {} days)",
+            prune_stats.processed_pruned, prune_stats.failed_pruned, config.state_retention_days
+        );
+        save_state(&config.state_file_uri, &state).await?;
+    }
+
     // List objects with prefix, filtering as we go
     let list_prefix = (!config.source_prefix.is_empty())
         .then(|| deltalake::Path::from(config.source_prefix.as_str()));
@@ -133,6 +145,12 @@ async fn poll_and_process(config: &Config) -> Result<(), anyhow::Error> {
         total_listed += 1;
 
         let name = obj.location.as_ref();
+
+        // Skip files in the archive prefix
+        if !config.archive_prefix.is_empty() && name.starts_with(&config.archive_prefix) {
+            continue;
+        }
+
         if is_supported_json_file(name) && !state.should_skip(name) {
             new_files.push(obj);
         }
@@ -326,7 +344,7 @@ async fn process_file_batch(
         *table = updated_table;
 
         // Save state for all processed files
-        state.processed_files.extend(processed_paths);
+        state.processed_files.extend(processed_paths.iter().cloned());
         save_state(&config.state_file_uri, state).await?;
 
         info!(
@@ -340,6 +358,24 @@ async fn process_file_batch(
                 String::new()
             }
         );
+
+        // Archive processed files if configured
+        if !config.archive_prefix.is_empty() {
+            let mut archived = 0;
+            for path in &processed_paths {
+                match archive_file(object_store, path, &config.source_prefix, &config.archive_prefix)
+                    .await
+                {
+                    Ok(()) => archived += 1,
+                    Err(e) => {
+                        warn!("Failed to archive {}: {:?}", path, e);
+                    }
+                }
+            }
+            if archived > 0 {
+                info!("Archived {} files to {}", archived, config.archive_prefix);
+            }
+        }
     }
 
     Ok(files_processed)
@@ -395,4 +431,35 @@ async fn commit_with_schema_evolution(
     table.load_version(post_commit.version()).await?;
 
     Ok(table)
+}
+
+/// Move a file from source to archive prefix (copy then delete)
+async fn archive_file(
+    object_store: &Arc<dyn ObjectStore>,
+    source_path: &str,
+    source_prefix: &str,
+    archive_prefix: &str,
+) -> Result<(), anyhow::Error> {
+    // Compute archive path by replacing source prefix with archive prefix
+    let archive_path = if source_path.starts_with(source_prefix) {
+        format!(
+            "{}{}",
+            archive_prefix,
+            &source_path[source_prefix.len()..]
+        )
+    } else {
+        format!("{}{}", archive_prefix, source_path)
+    };
+
+    let from = deltalake::Path::from(source_path);
+    let to = deltalake::Path::from(archive_path.as_str());
+
+    // Copy to archive location
+    object_store.copy(&from, &to).await?;
+
+    // Delete original
+    object_store.delete(&from).await?;
+
+    debug!("Archived {} -> {}", source_path, archive_path);
+    Ok(())
 }
