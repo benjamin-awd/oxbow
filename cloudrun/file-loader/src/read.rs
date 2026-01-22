@@ -113,10 +113,15 @@ async fn deserialize_stream(
             // Try decode again after flush
             have_read = decoder.decode(buf)?;
             if have_read == 0 {
-                // Still can't progress - skip one byte to avoid infinite loop
-                warn!("Decoder stuck, skipping byte");
-                reader.consume(1);
-                continue;
+                // Fail fast rather than silently dropping bytes which causes data loss
+                let preview_len = buf.len().min(100);
+                let preview = String::from_utf8_lossy(&buf[..preview_len]);
+                anyhow::bail!(
+                    "JSON decoder stuck: unable to parse data after flush. \
+                     Data preview (first {} bytes): {:?}",
+                    preview_len,
+                    preview
+                );
             }
         }
 
