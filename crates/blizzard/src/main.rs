@@ -65,21 +65,7 @@ async fn main() -> std::result::Result<(), Error> {
 
     let config = Config::from_env();
 
-    info!(
-        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
-        config.source_bucket,
-        config.source_prefix,
-        config.delta_table_uri,
-        config.delta_table_name,
-        config.state_file_uri,
-        config.poll_interval,
-        config.download_concurrency,
-        config.batch_size,
-        config.schema_evolution,
-        config.schema_sample_bytes,
-        config.file_timeout_secs,
-        config.max_file_retries
-    );
+    info!("Configuration: {config}");
 
     // Start health check server with heartbeat tracking
     let heartbeat = health::Heartbeat::new(HEALTH_MAX_AGE_SECS);

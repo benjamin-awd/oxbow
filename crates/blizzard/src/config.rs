@@ -1,3 +1,4 @@
+use std::fmt;
 use tracing::warn;
 
 pub struct Config {
@@ -67,5 +68,28 @@ impl Config {
             file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
             max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
         }
+    }
+}
+
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, \
+             concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, \
+             file_timeout={}s, max_retries={}",
+            self.source_bucket,
+            self.source_prefix,
+            self.delta_table_uri,
+            self.delta_table_name,
+            self.state_file_uri,
+            self.poll_interval,
+            self.download_concurrency,
+            self.batch_size,
+            self.schema_evolution,
+            self.schema_sample_bytes,
+            self.file_timeout_secs,
+            self.max_file_retries
+        )
     }
 }
