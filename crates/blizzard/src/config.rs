@@ -16,6 +16,9 @@ pub struct Config {
     pub file_timeout_secs: u64,
     /// Maximum number of consecutive failures for a file before marking it as permanently failed (default: 3)
     pub max_file_retries: usize,
+    /// Number of hours to look back when listing files (default: None = full listing).
+    /// When set, only lists files from the last N hours using date/hour partitioned prefixes.
+    pub listing_lookback_hours: Option<u64>,
 }
 
 fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T
@@ -63,16 +66,24 @@ impl Config {
             batch_size: parse_env_or("BATCH_SIZE", 4096),
             file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
             max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
+            listing_lookback_hours: std::env::var("LISTING_LOOKBACK_HOURS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&h| h > 0),
         }
     }
 }
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let lookback = match self.listing_lookback_hours {
+            Some(h) => format!("{}h", h),
+            None => "full".to_string(),
+        };
         write!(
             f,
             "bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, \
-             concurrency={}, batch_size={}, file_timeout={}s, max_retries={}",
+             concurrency={}, batch_size={}, file_timeout={}s, max_retries={}, listing_lookback={}",
             self.source_bucket,
             self.source_prefix,
             self.delta_table_uri,
@@ -82,7 +93,8 @@ impl fmt::Display for Config {
             self.download_concurrency,
             self.batch_size,
             self.file_timeout_secs,
-            self.max_file_retries
+            self.max_file_retries,
+            lookback
         )
     }
 }

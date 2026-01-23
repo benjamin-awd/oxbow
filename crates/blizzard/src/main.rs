@@ -14,6 +14,7 @@
 /// - POLL_INTERVAL_SECS: Polling interval in seconds (default: 10)
 /// - DOWNLOAD_CONCURRENCY: Concurrent file downloads (default: 50)
 /// - BATCH_SIZE: Records per batch when parsing JSON (default: 4096)
+/// - LISTING_LOOKBACK_HOURS: Only list files from last N hours (default: full listing)
 ///
 /// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
@@ -26,9 +27,9 @@ use blizzard::read::{
 };
 use blizzard::schema;
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
-use blizzard::store::ObjectStoreResultExt;
 use blizzard::write::commit_writer;
 
+use chrono::{Duration as ChronoDuration, Utc};
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::kernel::schema::{DataType, StructField};
 use deltalake::logstore::{StorageConfig, logstore_for};
@@ -43,9 +44,6 @@ use std::time::Duration;
 use tracing::log::*;
 use url::Url;
 
-/// Prefix where processed files are moved to
-const ARCHIVE_PREFIX: &str = "processed/";
-
 /// Number of files to process in a single Delta commit
 const FILE_BATCH_SIZE: usize = 100;
 
@@ -54,6 +52,9 @@ const HEALTH_MAX_AGE_SECS: u64 = 300;
 
 /// Number of bytes to sample when inferring schema from a JSON file
 const SCHEMA_SAMPLE_BYTES: usize = 64 * 1024;
+
+/// How long to keep processed file entries in state (4 hours, gives buffer beyond typical lookback)
+const STATE_PRUNE_AGE_SECS: u64 = 4 * 60 * 60;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Error> {
@@ -76,14 +77,21 @@ async fn main() -> std::result::Result<(), Error> {
     let addr = format!("0.0.0.0:{port}");
     health::spawn_health_server(addr, heartbeat.clone());
 
+    // Load state once at startup
+    let mut state = load_state(&config.state_file_uri).await?;
+    let mut state_initialized = !state.processed_files.is_empty();
+
     loop {
-        if let Err(e) = poll_and_process(&config).await {
-            if e.is_fatal() {
-                error!("Fatal error during poll cycle: {:?}", e);
-            } else if e.is_transient() {
-                warn!("Transient error during poll cycle (will retry): {:?}", e);
-            } else {
-                error!("Error during poll cycle: {:?}", e);
+        match poll_and_process(&config, &mut state, &mut state_initialized).await {
+            Ok(_) => {}
+            Err(e) => {
+                if e.is_fatal() {
+                    error!("Fatal error during poll cycle: {:?}", e);
+                } else if e.is_transient() {
+                    warn!("Transient error during poll cycle (will retry): {:?}", e);
+                } else {
+                    error!("Error during poll cycle: {:?}", e);
+                }
             }
         }
 
@@ -94,12 +102,11 @@ async fn main() -> std::result::Result<(), Error> {
     }
 }
 
-async fn poll_and_process(config: &Config) -> Result<()> {
-    debug!(
-        "Polling gs://{}/{} for new files",
-        config.source_bucket, config.source_prefix
-    );
-
+async fn poll_and_process(
+    config: &Config,
+    state: &mut ProcessedState,
+    state_initialized: &mut bool,
+) -> Result<()> {
     let bucket_url =
         Url::parse(&format!("gs://{}", config.source_bucket)).context(UrlParseSnafu {
             url: format!("gs://{}", config.source_bucket),
@@ -107,16 +114,34 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     let store = logstore_for(&bucket_url, StorageConfig::default()).context(DeltaTableSnafu)?;
     let object_store = store.object_store(None);
 
-    let mut state = load_state(&config.state_file_uri).await?;
+    // Determine listing strategy: time-bounded or full
+    let (files_to_check, listing_mode) = if let Some(hours) = config.listing_lookback_hours {
+        debug!(
+            "Listing gs://{}/{} with {}h lookback",
+            config.source_bucket, config.source_prefix, hours
+        );
+        let files =
+            list_files_time_bounded(&object_store, &config.source_prefix, hours, state).await?;
+        (files, format!("{}h lookback", hours))
+    } else {
+        debug!(
+            "Listing gs://{}/{} (full)",
+            config.source_bucket, config.source_prefix
+        );
+        let files = list_files_full(&object_store, &config.source_prefix, state).await?;
+        (files, "full".to_string())
+    };
 
-    let list_prefix = (!config.source_prefix.is_empty())
-        .then(|| deltalake::Path::from(config.source_prefix.as_str()));
+    let total_listed = files_to_check.len();
+    debug!("Listed {} files ({})", total_listed, listing_mode);
 
-    // Stream listing and process in chunks to avoid loading all file metadata into memory
-    let mut listing = object_store.list(list_prefix.as_ref());
+    if files_to_check.is_empty() {
+        debug!("No files to check");
+        return Ok(());
+    }
 
-    // First, peek at the listing to get the first valid file for table creation
-    let first_file = peek_first_valid_file(&mut listing, &state).await?;
+    // Get first valid file for table creation if needed
+    let first_file = files_to_check.first().cloned();
 
     // Try to open the Delta table, creating it if it doesn't exist
     let mut table = match oxbow::lock::open_table(&config.delta_table_uri).await {
@@ -145,133 +170,142 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         .snapshot()
         .arrow_schema();
 
-    // Query Delta table for files that have already been processed
-    // This provides atomic state tracking - if a crash occurs after Delta commit,
-    // we won't reprocess files because they're already tracked in the table
-    let delta_processed_files = query_processed_files(&table).await?;
-    if !delta_processed_files.is_empty() {
-        info!(
-            "Found {} previously processed files in Delta table",
-            delta_processed_files.len()
-        );
+    // On first poll (or after restart), populate state from Delta table
+    // This ensures atomicity: Delta is the source of truth
+    if !*state_initialized {
+        info!("Initializing processed files cache from Delta table...");
+        let delta_processed = query_processed_files(&table).await?;
+        if !delta_processed.is_empty() {
+            info!(
+                "Populated {} processed files from Delta table",
+                delta_processed.len()
+            );
+            state.populate_from_delta(delta_processed);
+            save_state(&config.state_file_uri, state).await?;
+        }
+        *state_initialized = true;
     }
 
-    // Process files in batches as we stream the listing
-    let mut batch: Vec<deltalake::ObjectMeta> = Vec::with_capacity(FILE_BATCH_SIZE);
+    // Filter to files not yet processed (using state cache)
+    let files_to_process: Vec<_> = files_to_check
+        .into_iter()
+        .filter(|obj| !state.is_processed(obj.location.as_ref()))
+        .collect();
+
+    if files_to_process.is_empty() {
+        debug!("No new files to process ({} listed)", total_listed);
+        return Ok(());
+    }
+
+    // Process files in batches
     let mut total_processed = 0usize;
-    let mut total_listed = 0usize;
-    let mut batch_num = 0usize;
 
-    // Add the first file to the batch if it wasn't already processed
-    if let Some(f) = first_file {
-        total_listed += 1;
-        if !delta_processed_files.contains(f.location.as_ref()) {
-            batch.push(f);
-        }
-    }
-
-    // Continue streaming the rest of the listing
-    while let Some(result) = listing.next().await {
-        let obj = result.map_err(|e| {
-            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
-        })?;
-        total_listed += 1;
-
-        let name = obj.location.as_ref();
-
-        // Skip archived files
-        if name.starts_with(ARCHIVE_PREFIX) {
-            continue;
-        }
-
-        // Collect supported JSON files that haven't permanently failed and aren't already processed
-        if is_supported_json_file(name)
-            && !state.is_permanently_failed(name)
-            && !delta_processed_files.contains(name)
-        {
-            batch.push(obj);
-        }
-
-        // Process batch when it reaches FILE_BATCH_SIZE
-        if batch.len() >= FILE_BATCH_SIZE {
-            batch_num += 1;
-            info!("Processing batch {} ({} files)", batch_num, batch.len());
-            let processed = process_file_batch(
-                &batch,
-                &object_store,
-                &arrow_schema,
-                &mut table,
-                &mut state,
-                config,
-            )
-            .await?;
-            total_processed += processed;
-            batch.clear();
-        }
-    }
-
-    // Process remaining files in the final batch
-    if !batch.is_empty() {
-        if batch_num > 0 {
-            batch_num += 1;
-            info!("Processing batch {} ({} files)", batch_num, batch.len());
+    for (batch_idx, batch) in files_to_process.chunks(FILE_BATCH_SIZE).enumerate() {
+        if files_to_process.len() > FILE_BATCH_SIZE {
+            info!("Processing batch {} ({} files)", batch_idx + 1, batch.len());
         } else {
             info!("Processing {} files", batch.len());
         }
+
         let processed = process_file_batch(
-            &batch,
+            batch,
             &object_store,
             &arrow_schema,
             &mut table,
-            &mut state,
+            state,
             config,
         )
         .await?;
         total_processed += processed;
     }
 
+    // Prune old entries from state to keep it bounded
+    state.prune_old_entries(STATE_PRUNE_AGE_SECS);
+
     if total_processed > 0 {
         info!(
             "Completed: processed {} files out of {} listed",
             total_processed, total_listed
         );
-    } else {
-        debug!("No new files to process ({} listed)", total_listed);
     }
 
     Ok(())
 }
 
-/// Peek at the listing stream to get the first valid file for table creation.
-/// This consumes only the first matching file from the stream.
-async fn peek_first_valid_file(
-    listing: &mut futures::stream::BoxStream<
-        'static,
-        std::result::Result<deltalake::ObjectMeta, deltalake::ObjectStoreError>,
-    >,
+/// List files using time-bounded prefixes (last N hours).
+/// Only lists files from hour-partitioned paths within the lookback window.
+async fn list_files_time_bounded(
+    object_store: &Arc<dyn ObjectStore>,
+    source_prefix: &str,
+    lookback_hours: u64,
     state: &ProcessedState,
-) -> Result<Option<deltalake::ObjectMeta>> {
-    while let Some(result) = listing.next().await {
-        let obj = result.map_err(|e| ObjectStoreError::from_source(e, "listing"))?;
-        let name = obj.location.as_ref();
+) -> Result<Vec<deltalake::ObjectMeta>> {
+    let prefixes = generate_hour_prefixes(source_prefix, lookback_hours);
+    let mut all_files = Vec::new();
 
-        // Skip archived files
-        if name.starts_with(ARCHIVE_PREFIX) {
-            continue;
-        }
+    for prefix in prefixes {
+        let path = deltalake::Path::from(prefix.as_str());
+        let mut listing = object_store.list(Some(&path));
 
-        // Return first supported JSON file that hasn't permanently failed
-        if is_supported_json_file(name) && !state.is_permanently_failed(name) {
-            return Ok(Some(obj));
+        while let Some(result) = listing.next().await {
+            let obj = result.map_err(|e| ObjectStoreError::from_source(e, &prefix))?;
+            let name = obj.location.as_ref();
+
+            if is_supported_json_file(name) && !state.is_permanently_failed(name) {
+                all_files.push(obj);
+            }
         }
     }
-    Ok(None)
+
+    Ok(all_files)
+}
+
+/// List all files under the source prefix (full listing).
+async fn list_files_full(
+    object_store: &Arc<dyn ObjectStore>,
+    source_prefix: &str,
+    state: &ProcessedState,
+) -> Result<Vec<deltalake::ObjectMeta>> {
+    let path = (!source_prefix.is_empty()).then(|| deltalake::Path::from(source_prefix));
+    let mut listing = object_store.list(path.as_ref());
+    let mut files = Vec::new();
+
+    while let Some(result) = listing.next().await {
+        let obj = result.map_err(|e| ObjectStoreError::from_source(e, source_prefix))?;
+        let name = obj.location.as_ref();
+
+        if is_supported_json_file(name) && !state.is_permanently_failed(name) {
+            files.push(obj);
+        }
+    }
+
+    Ok(files)
+}
+
+/// Generates hour-partitioned prefixes for the last N hours.
+/// Returns prefixes in the format: `{base_prefix}/date=YYYY-MM-DD/hour=HH/`
+fn generate_hour_prefixes(base_prefix: &str, lookback_hours: u64) -> Vec<String> {
+    let now = Utc::now();
+    let mut prefixes = Vec::with_capacity(lookback_hours as usize);
+
+    for i in 0..lookback_hours {
+        let time = now - ChronoDuration::hours(i as i64);
+        let date = time.format("%Y-%m-%d");
+        let hour = time.format("%H");
+
+        let prefix = if base_prefix.is_empty() {
+            format!("date={}/hour={}/", date, hour)
+        } else {
+            let base = base_prefix.trim_end_matches('/');
+            format!("{}/date={}/hour={}/", base, date, hour)
+        };
+        prefixes.push(prefix);
+    }
+
+    prefixes
 }
 
 /// Create a new Delta table by inferring schema from a JSON file.
-///
-/// This function samples the schema from the first JSON file and creates a Delta table
-/// with the inferred schema plus the `_source_file` column for tracking.
 async fn create_table_from_json(
     table_uri: &str,
     object_store: &Arc<dyn ObjectStore>,
@@ -283,7 +317,6 @@ async fn create_table_from_json(
 
     info!("Inferring schema from {} to create Delta table", file_path);
 
-    // Sample schema from JSON file
     let arrow_schema = sample_schema_from_file(
         object_store,
         &sample_file.location,
@@ -292,7 +325,6 @@ async fn create_table_from_json(
     )
     .await?;
 
-    // Convert Arrow fields to Delta StructFields
     let mut columns: Vec<StructField> = Vec::new();
     for field in arrow_schema.fields() {
         let coerced = oxbow::coerce_field(field.clone());
@@ -306,7 +338,6 @@ async fn create_table_from_json(
         }
     }
 
-    // Add _source_file column for atomic state tracking
     columns.push(schema::source_file_field());
 
     info!(
@@ -315,7 +346,6 @@ async fn create_table_from_json(
         file_path
     );
 
-    // Create the table
     let table_url = Url::parse(table_uri).context(UrlParseSnafu { url: table_uri })?;
     let store = logstore_for(&table_url, StorageConfig::default()).context(DeltaTableSnafu)?;
 
@@ -369,7 +399,6 @@ async fn process_file_batch(
                     file_path, size, is_compressed
                 );
 
-                // Apply timeout to the file download and parsing
                 let result = tokio::time::timeout(
                     file_timeout,
                     stream_and_parse_file(&store, &location, schema, is_compressed, batch_size),
@@ -432,7 +461,10 @@ async fn process_file_batch(
     if has_batches {
         *table = commit_writer(table.clone(), writer).await?;
 
-        // Save state file for failure tracking (processed files are now tracked in Delta)
+        // Mark files as processed in state (after successful Delta commit)
+        state.mark_processed_batch(&processed_paths);
+
+        // Save state
         save_state(&config.state_file_uri, state).await?;
 
         info!(
@@ -441,64 +473,9 @@ async fn process_file_batch(
             total_records,
             table.version(),
         );
-
-        archive_processed_files(object_store, &processed_paths).await;
     }
 
     Ok(files_processed)
-}
-
-async fn archive_processed_files(object_store: &Arc<dyn ObjectStore>, paths: &[String]) {
-    let mut archived = 0;
-    for path in paths {
-        match archive_file(object_store, path, ARCHIVE_PREFIX).await {
-            Ok(()) => archived += 1,
-            Err(Error::ObjectStore {
-                source: ObjectStoreError::NotFound { .. },
-            }) => {
-                debug!(
-                    "File {} already gone during archive, treating as success",
-                    path
-                );
-                archived += 1;
-            }
-            Err(e) => {
-                warn!("Failed to archive {}: {:?}", path, e);
-            }
-        }
-    }
-    if archived > 0 {
-        info!("Archived {} files to {}", archived, ARCHIVE_PREFIX);
-    }
-}
-
-async fn archive_file(
-    object_store: &Arc<dyn ObjectStore>,
-    source_path: &str,
-    archive_prefix: &str,
-) -> Result<()> {
-    let archive_path = compute_archive_path(source_path, archive_prefix);
-
-    let from = deltalake::Path::from(source_path);
-    let to = deltalake::Path::from(archive_path.as_str());
-
-    object_store
-        .copy(&from, &to)
-        .await
-        .with_path_context(source_path)?;
-    object_store
-        .delete(&from)
-        .await
-        .with_path_context(source_path)?;
-
-    debug!("Archived {} -> {}", source_path, archive_path);
-    Ok(())
-}
-
-/// Computes the archive path for a source file.
-/// Preserves the full source path to avoid collisions between different source prefixes.
-fn compute_archive_path(source_path: &str, archive_prefix: &str) -> String {
-    format!("{}{}", archive_prefix, source_path)
 }
 
 #[cfg(test)]
@@ -506,17 +483,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_archive_path_preserves_full_path_structure() {
-        let source_path = "region=asia-northeast1/auth_type=public/subject=orderbooks/version=v1/2024/01/file.json";
-        let archive_prefix = "processed/";
+    fn test_generate_hour_prefixes_with_base_prefix() {
+        let prefixes = generate_hour_prefixes("region=us/subject=ticks/version=v1", 2);
 
-        let archive_path = compute_archive_path(source_path, archive_prefix);
+        assert_eq!(prefixes.len(), 2);
+        for prefix in &prefixes {
+            assert!(prefix.starts_with("region=us/subject=ticks/version=v1/date="));
+            assert!(prefix.contains("/hour="));
+            assert!(prefix.ends_with('/'));
+        }
+    }
 
-        // The archive path should preserve the full path structure to avoid collisions
-        assert_eq!(
-            archive_path,
-            "processed/region=asia-northeast1/auth_type=public/subject=orderbooks/version=v1/2024/01/file.json",
-            "Archive path should preserve full source path to avoid collisions between different source prefixes"
-        );
+    #[test]
+    fn test_generate_hour_prefixes_empty_base() {
+        let prefixes = generate_hour_prefixes("", 1);
+
+        assert_eq!(prefixes.len(), 1);
+        assert!(prefixes[0].starts_with("date="));
+        assert!(prefixes[0].contains("/hour="));
     }
 }

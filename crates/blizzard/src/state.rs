@@ -1,3 +1,4 @@
+use chrono::Utc;
 use deltalake::DeltaTable;
 use deltalake::arrow::array::Array;
 use deltalake::datafusion::prelude::SessionContext;
@@ -29,7 +30,8 @@ pub struct FileFailure {
     pub is_transient: Option<bool>,
 }
 
-/// State file tracking file failures (processed files are tracked in Delta via _source_file column)
+/// State file tracking processed files and failures.
+/// Processed files are cached here for fast deduplication, with Delta as source of truth.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProcessedState {
     /// Files that have failed processing with their retry counts
@@ -38,6 +40,9 @@ pub struct ProcessedState {
     /// Files that have permanently failed (exceeded max retries)
     #[serde(default)]
     pub permanently_failed: HashSet<String>,
+    /// Successfully processed files with Unix timestamp (for pruning old entries)
+    #[serde(default)]
+    pub processed_files: HashMap<String, i64>,
 }
 
 impl ProcessedState {
@@ -89,9 +94,50 @@ impl ProcessedState {
     }
 
     /// Check if a file should be skipped due to permanent failure
-    /// Note: Successfully processed files are tracked via Delta's _source_file column
     pub fn is_permanently_failed(&self, path: &str) -> bool {
         self.permanently_failed.contains(path)
+    }
+
+    /// Check if a file has already been processed
+    pub fn is_processed(&self, path: &str) -> bool {
+        self.processed_files.contains_key(path)
+    }
+
+    /// Mark a file as successfully processed
+    pub fn mark_processed(&mut self, path: &str) {
+        let now = Utc::now().timestamp();
+        self.processed_files.insert(path.to_string(), now);
+        // Clear any failure record for this file
+        self.clear_failure(path);
+    }
+
+    /// Mark multiple files as processed
+    pub fn mark_processed_batch(&mut self, paths: &[String]) {
+        let now = Utc::now().timestamp();
+        for path in paths {
+            self.processed_files.insert(path.clone(), now);
+            self.failed_files.remove(path);
+        }
+    }
+
+    /// Populate processed files from Delta table query (used on startup)
+    pub fn populate_from_delta(&mut self, files: HashSet<String>) {
+        let now = Utc::now().timestamp();
+        for file in files {
+            // Only add if not already tracked (preserve existing timestamps)
+            self.processed_files.entry(file).or_insert(now);
+        }
+    }
+
+    /// Remove processed file entries older than max_age_secs
+    pub fn prune_old_entries(&mut self, max_age_secs: u64) {
+        let cutoff = Utc::now().timestamp() - max_age_secs as i64;
+        let before = self.processed_files.len();
+        self.processed_files.retain(|_, ts| *ts > cutoff);
+        let pruned = before - self.processed_files.len();
+        if pruned > 0 {
+            debug!("Pruned {} old entries from processed files cache", pruned);
+        }
     }
 }
 
@@ -255,12 +301,46 @@ mod tests {
 
     #[test]
     fn test_backward_compatibility() {
-        // Old state format with processed_files should still deserialize (ignored)
-        let old_json = r#"{"processed_files":["file1.json"]}"#;
+        // Old state format without processed_files should still deserialize
+        let old_json = r#"{"failed_files":{},"permanently_failed":["bad.json"]}"#;
         let state: ProcessedState = serde_json::from_str(old_json).unwrap();
 
-        // processed_files is now ignored, only failure tracking matters
         assert!(state.failed_files.is_empty());
-        assert!(state.permanently_failed.is_empty());
+        assert!(state.permanently_failed.contains("bad.json"));
+        assert!(state.processed_files.is_empty());
+    }
+
+    #[test]
+    fn test_processed_files_tracking() {
+        let mut state = ProcessedState::default();
+
+        // Initially not processed
+        assert!(!state.is_processed("file1.json"));
+
+        // Mark as processed
+        state.mark_processed("file1.json");
+        assert!(state.is_processed("file1.json"));
+
+        // Batch marking
+        state.mark_processed_batch(&["file2.json".to_string(), "file3.json".to_string()]);
+        assert!(state.is_processed("file2.json"));
+        assert!(state.is_processed("file3.json"));
+    }
+
+    #[test]
+    fn test_prune_old_entries() {
+        let mut state = ProcessedState::default();
+
+        // Add some entries with old timestamps
+        let old_ts = Utc::now().timestamp() - 1000;
+        state.processed_files.insert("old.json".to_string(), old_ts);
+        state.mark_processed("new.json");
+
+        // Prune entries older than 500 seconds
+        state.prune_old_entries(500);
+
+        // Old entry should be gone, new one should remain
+        assert!(!state.is_processed("old.json"));
+        assert!(state.is_processed("new.json"));
     }
 }
