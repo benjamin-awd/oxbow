@@ -542,31 +542,31 @@ async fn process_file_batch(
             }
         );
 
-        let mut archived = 0;
-        for path in &processed_paths {
-            match archive_file(object_store, path, ARCHIVE_PREFIX).await {
-                Ok(()) => archived += 1,
-                Err(Error::ObjectStore {
-                    source: ObjectStoreError::NotFound { .. },
-                }) => {
-                    // File already archived or deleted - treat as success
-                    debug!(
-                        "File {} already gone during archive, treating as success",
-                        path
-                    );
-                    archived += 1;
-                }
-                Err(e) => {
-                    warn!("Failed to archive {}: {:?}", path, e);
-                }
-            }
-        }
-        if archived > 0 {
-            info!("Archived {} files to {}", archived, ARCHIVE_PREFIX);
-        }
+        archive_processed_files(object_store, &processed_paths).await;
     }
 
     Ok(files_processed)
+}
+
+async fn archive_processed_files(object_store: &Arc<dyn ObjectStore>, paths: &[String]) {
+    let mut archived = 0;
+    for path in paths {
+        match archive_file(object_store, path, ARCHIVE_PREFIX).await {
+            Ok(()) => archived += 1,
+            Err(Error::ObjectStore {
+                source: ObjectStoreError::NotFound { .. },
+            }) => {
+                debug!("File {} already gone during archive, treating as success", path);
+                archived += 1;
+            }
+            Err(e) => {
+                warn!("Failed to archive {}: {:?}", path, e);
+            }
+        }
+    }
+    if archived > 0 {
+        info!("Archived {} files to {}", archived, ARCHIVE_PREFIX);
+    }
 }
 
 async fn archive_file(
