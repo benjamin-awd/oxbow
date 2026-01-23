@@ -46,15 +46,13 @@ pub async fn stream_and_parse_file(
     Ok((batches, total_records))
 }
 
-/// Sample schema from a JSON file by reading and inferring from the first N bytes
+/// Infer schema from a JSON file by reading the entire file.
 ///
-/// This avoids reading the entire file when we only need to detect schema changes.
-/// For compressed files, decompresses the sampled bytes before inference.
-pub async fn sample_schema_from_file(
+/// For compressed files, decompresses before inference.
+pub async fn infer_schema_from_file(
     store: &Arc<dyn ObjectStore>,
     path: &deltalake::Path,
     is_compressed: bool,
-    sample_bytes: usize,
 ) -> Result<ArrowSchema> {
     let get_result = store
         .get(path)
@@ -63,21 +61,22 @@ pub async fn sample_schema_from_file(
     let byte_stream = get_result.into_stream().map_err(std::io::Error::other);
     let stream_reader = StreamReader::new(byte_stream);
 
-    let sample = if is_compressed {
+    let data = if is_compressed {
         let mut buf_reader = BufReader::new(GzipDecoder::new(BufReader::new(stream_reader)));
-        let mut decompressed = vec![0u8; sample_bytes];
-        let bytes_read = buf_reader.read(&mut decompressed).await.context(IoSnafu)?;
-        decompressed.truncate(bytes_read);
+        let mut decompressed = Vec::new();
+        buf_reader
+            .read_to_end(&mut decompressed)
+            .await
+            .context(IoSnafu)?;
         decompressed
     } else {
         let mut buf_reader = BufReader::new(stream_reader);
-        let mut buffer = vec![0u8; sample_bytes];
-        let bytes_read = buf_reader.read(&mut buffer).await.context(IoSnafu)?;
-        buffer.truncate(bytes_read);
+        let mut buffer = Vec::new();
+        buf_reader.read_to_end(&mut buffer).await.context(IoSnafu)?;
         buffer
     };
 
-    infer_schema_from_json_sample(&sample)
+    infer_schema_from_json_sample(&data)
 }
 
 /// Augments a RecordBatch with a `_source_file` column containing the source file path

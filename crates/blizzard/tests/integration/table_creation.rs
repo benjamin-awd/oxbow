@@ -5,7 +5,7 @@
 //! 2. Arrow schema is correctly converted to Delta schema
 //! 3. Tables are created with the correct columns including _source_file
 
-use blizzard::read::{is_gzip_compressed, sample_schema_from_file};
+use blizzard::read::{infer_schema_from_file, is_gzip_compressed};
 use blizzard::schema::{SOURCE_FILE_COLUMN, source_file_field};
 use deltalake::Path;
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
@@ -62,7 +62,7 @@ async fn test_create_table_from_json_schema() {
     let is_compressed = is_gzip_compressed(file_path);
     let location = Path::from(file_path);
 
-    let arrow_schema = sample_schema_from_file(&object_store, &location, is_compressed, 65536)
+    let arrow_schema = infer_schema_from_file(&object_store, &location, is_compressed)
         .await
         .unwrap();
 
@@ -118,7 +118,7 @@ async fn test_create_table_from_nested_json_schema() {
     write_json_file(&object_store, "nested.json", json_content).await;
 
     let location = Path::from("nested.json");
-    let arrow_schema = sample_schema_from_file(&object_store, &location, false, 65536)
+    let arrow_schema = infer_schema_from_file(&object_store, &location, false)
         .await
         .unwrap();
 
@@ -185,7 +185,7 @@ async fn test_create_table_from_gzipped_json() {
     // Verify is_gzip_compressed works
     assert!(is_gzip_compressed("data.json.gz"));
 
-    let arrow_schema = sample_schema_from_file(&object_store, &location, true, 65536)
+    let arrow_schema = infer_schema_from_file(&object_store, &location, true)
         .await
         .unwrap();
 

@@ -22,7 +22,7 @@ use blizzard::config::Config;
 use blizzard::error::{DeltaTableSnafu, Error, ObjectStoreError, Result, UrlParseSnafu};
 use blizzard::health;
 use blizzard::read::{
-    augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
+    augment_with_source_file, infer_schema_from_file, is_gzip_compressed, is_supported_json_file,
     stream_and_parse_file,
 };
 use blizzard::schema;
@@ -49,9 +49,6 @@ const FILE_BATCH_SIZE: usize = 100;
 
 /// Max age in seconds before health check considers service unhealthy
 const HEALTH_MAX_AGE_SECS: u64 = 300;
-
-/// Number of bytes to sample when inferring schema from a JSON file
-const SCHEMA_SAMPLE_BYTES: usize = 64 * 1024;
 
 /// How long to keep processed file entries in state (4 hours, gives buffer beyond typical lookback)
 const STATE_PRUNE_AGE_SECS: u64 = 4 * 60 * 60;
@@ -317,13 +314,8 @@ async fn create_table_from_json(
 
     info!("Inferring schema from {} to create Delta table", file_path);
 
-    let arrow_schema = sample_schema_from_file(
-        object_store,
-        &sample_file.location,
-        is_compressed,
-        SCHEMA_SAMPLE_BYTES,
-    )
-    .await?;
+    let arrow_schema =
+        infer_schema_from_file(object_store, &sample_file.location, is_compressed).await?;
 
     let mut columns: Vec<StructField> = Vec::new();
     for field in arrow_schema.fields() {
