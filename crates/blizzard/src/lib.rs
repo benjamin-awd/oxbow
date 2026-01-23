@@ -10,3 +10,4 @@ pub mod read;
 pub mod schema;
 pub mod state;
 pub mod store;
+pub mod write;

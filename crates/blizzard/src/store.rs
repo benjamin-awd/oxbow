@@ -1,8 +1,8 @@
 //! Object store utilities for consistent store setup and error handling.
 
 use crate::error::{DeltaTableSnafu, ObjectStoreError, Result, UrlParseSnafu};
-use deltalake::logstore::{logstore_for, StorageConfig};
 use deltalake::ObjectStore;
+use deltalake::logstore::{StorageConfig, logstore_for};
 use snafu::ResultExt;
 use std::sync::Arc;
 use url::Url;
