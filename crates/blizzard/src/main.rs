@@ -59,10 +59,11 @@ async fn main() -> std::result::Result<(), Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
+        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
+        config.delta_table_name,
         config.state_file_uri,
         config.poll_interval,
         config.download_concurrency,
@@ -296,11 +297,16 @@ async fn create_table_from_json(
     let table = CreateBuilder::new()
         .with_log_store(store)
         .with_columns(columns)
+        .with_table_name(&config.delta_table_name)
         .with_save_mode(SaveMode::Ignore)
         .await
         .context(DeltaTableSnafu)?;
 
-    info!("Created Delta table at {}", table_uri);
+    info!(
+        "Created Delta table '{}' at {}",
+        config.delta_table_name, table_uri
+    );
+
     Ok(table)
 }
 

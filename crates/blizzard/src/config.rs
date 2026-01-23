@@ -4,6 +4,9 @@ pub struct Config {
     pub source_bucket: String,
     pub source_prefix: String,
     pub delta_table_uri: String,
+    /// Table name derived from the last path segment of delta_table_uri.
+    /// Used when creating a new Delta table to set the name in metadata.
+    pub delta_table_name: String,
     pub state_file_uri: String,
     pub poll_interval: u64,
     pub download_concurrency: usize,
@@ -39,12 +42,22 @@ impl Config {
             .expect("DELTA_TABLE_URI environment variable required");
         let state_file_uri = format!("{delta_table_uri}/_file_loader_state.json");
 
+        // Derive table name from the last path segment of the URI
+        // e.g., "gs://bucket/delta/my_table" -> "my_table"
+        let delta_table_name = delta_table_uri
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .expect("DELTA_TABLE_URI must have a path segment for table name")
+            .to_string();
+
         Self {
             source_bucket: std::env::var("SOURCE_BUCKET")
                 .expect("SOURCE_BUCKET environment variable required"),
             source_prefix: std::env::var("SOURCE_PREFIX")
                 .expect("SOURCE_PREFIX environment variable required"),
             delta_table_uri,
+            delta_table_name,
             state_file_uri,
             poll_interval: parse_env_or("POLL_INTERVAL_SECS", 10),
             download_concurrency: parse_env_or("DOWNLOAD_CONCURRENCY", 50),
