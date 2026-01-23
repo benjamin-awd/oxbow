@@ -13,7 +13,14 @@ use url::Url;
 /// ensuring consistent URL parsing and error handling.
 pub async fn object_store_for_uri(uri: &str) -> Result<(Arc<dyn ObjectStore>, deltalake::Path)> {
     let url = Url::parse(uri).context(UrlParseSnafu { url: uri })?;
-    let store = logstore_for(&url, StorageConfig::default()).context(DeltaTableSnafu)?;
+    // Create store from just the bucket root to avoid path duplication
+    let root_url = Url::parse(&format!(
+        "{}://{}/",
+        url.scheme(),
+        url.host_str().unwrap_or("")
+    ))
+    .context(UrlParseSnafu { url: uri })?;
+    let store = logstore_for(&root_url, StorageConfig::default()).context(DeltaTableSnafu)?;
     let path = deltalake::Path::from(url.path());
     Ok((store.object_store(None), path))
 }
