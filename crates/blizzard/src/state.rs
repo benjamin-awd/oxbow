@@ -6,13 +6,13 @@ use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::log::*;
-use url::Url;
 
 use crate::error::{
     DataFusionSnafu, DeltaTableSnafu, Error, ErrorCategory, ObjectStoreError, Result,
-    StateSerializationSnafu, UrlParseSnafu,
+    StateSerializationSnafu,
 };
 use crate::schema::SOURCE_FILE_COLUMN;
+use crate::store::{ObjectStoreResultExt, object_store_for_uri};
 
 /// Tracks failure information for a file
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,20 +147,11 @@ pub async fn query_processed_files(table: &DeltaTable) -> Result<HashSet<String>
 }
 
 pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState> {
-    use deltalake::logstore::{StorageConfig, logstore_for};
+    let (store, path) = object_store_for_uri(state_file_uri).await?;
 
-    let url = Url::parse(state_file_uri).context(UrlParseSnafu {
-        url: state_file_uri,
-    })?;
-    let store = logstore_for(&url, StorageConfig::default()).context(DeltaTableSnafu)?;
-    let path = deltalake::Path::from(url.path());
-
-    match store.object_store(None).get(&path).await {
+    match store.get(&path).await {
         Ok(result) => {
-            let bytes = result
-                .bytes()
-                .await
-                .map_err(|e| ObjectStoreError::from_source(e, state_file_uri))?;
+            let bytes = result.bytes().await.with_path_context(state_file_uri)?;
             let state: ProcessedState =
                 serde_json::from_slice(&bytes).context(StateSerializationSnafu)?;
             debug!(
@@ -179,20 +170,13 @@ pub async fn load_state(state_file_uri: &str) -> Result<ProcessedState> {
 }
 
 pub async fn save_state(state_file_uri: &str, state: &ProcessedState) -> Result<()> {
-    use deltalake::logstore::{StorageConfig, logstore_for};
-
-    let url = Url::parse(state_file_uri).context(UrlParseSnafu {
-        url: state_file_uri,
-    })?;
-    let store = logstore_for(&url, StorageConfig::default()).context(DeltaTableSnafu)?;
-    let path = deltalake::Path::from(url.path());
+    let (store, path) = object_store_for_uri(state_file_uri).await?;
 
     let bytes = serde_json::to_vec_pretty(state).context(StateSerializationSnafu)?;
     store
-        .object_store(None)
         .put(&path, bytes.into())
         .await
-        .map_err(|e| ObjectStoreError::from_source(e, state_file_uri))?;
+        .with_path_context(state_file_uri)?;
 
     Ok(())
 }
