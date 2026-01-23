@@ -161,11 +161,14 @@ async fn poll_and_process(
         Err(e) => return Err(Error::DeltaTable { source: e }),
     };
 
-    let arrow_schema = table
-        .snapshot()
-        .context(DeltaTableSnafu)?
-        .snapshot()
-        .arrow_schema();
+    // Get schema without _source_file for parsing JSON (we add it after parsing)
+    let arrow_schema = Arc::new(schema::without_source_file_column(
+        &table
+            .snapshot()
+            .context(DeltaTableSnafu)?
+            .snapshot()
+            .arrow_schema(),
+    ));
 
     // On first poll (or after restart), populate state from Delta table
     // This ensures atomicity: Delta is the source of truth

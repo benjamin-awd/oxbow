@@ -61,7 +61,15 @@ resource "google_cloud_run_v2_service" "file_loader" {
 
       env {
         name  = "POLL_INTERVAL_SECS"
-        value = "10"
+        value = tostring(var.file_loader_poll_interval_secs)
+      }
+
+      dynamic "env" {
+        for_each = var.file_loader_listing_lookback_hours != null ? [1] : []
+        content {
+          name  = "LISTING_LOOKBACK_HOURS"
+          value = tostring(var.file_loader_listing_lookback_hours)
+        }
       }
 
       ports {

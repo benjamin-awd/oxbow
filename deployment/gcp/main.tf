@@ -74,6 +74,18 @@ variable "file_loader_image" {
   default     = "asia-northeast1-docker.pkg.dev/data-dev-596660/main-asia/oxbow/file-loader:latest"
 }
 
+variable "file_loader_poll_interval_secs" {
+  description = "Polling interval in seconds"
+  type        = number
+  default     = 10
+}
+
+variable "file_loader_listing_lookback_hours" {
+  description = "Only list files from last N hours (reduces listing time for large buckets)"
+  type        = number
+  default     = null
+}
+
 # Local values
 locals {
   service_name_prefix = "oxbow-${var.environment}"

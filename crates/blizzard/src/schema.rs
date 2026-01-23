@@ -16,12 +16,50 @@ pub fn source_file_field() -> StructField {
     StructField::new(SOURCE_FILE_COLUMN.to_string(), DataType::STRING, false)
 }
 
-/// Infer an Arrow schema from a JSON sample
+/// Infer an Arrow schema from a JSON sample.
+///
+/// All inferred fields are made nullable since JSON data may have missing fields
+/// or nulls that weren't present in the sample used for inference.
 pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema> {
     let cursor = Cursor::new(sample);
     let (schema, _) =
         infer_json_schema_from_seekable(cursor, None).context(SchemaInferenceSnafu)?;
-    Ok(schema)
+
+    // Make all fields nullable to handle missing/null values in subsequent records
+    let nullable_fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| Arc::new(make_field_nullable(f)))
+        .collect();
+
+    Ok(ArrowSchema::new(nullable_fields))
+}
+
+/// Recursively make a field and all its nested fields nullable
+fn make_field_nullable(field: &Field) -> Field {
+    use deltalake::arrow::datatypes::DataType as ArrowDataType;
+
+    let new_data_type = match field.data_type() {
+        ArrowDataType::Struct(fields) => {
+            let nullable_fields: Vec<Arc<Field>> = fields
+                .iter()
+                .map(|f| Arc::new(make_field_nullable(f)))
+                .collect();
+            ArrowDataType::Struct(nullable_fields.into())
+        }
+        ArrowDataType::List(inner) => {
+            ArrowDataType::List(Arc::new(make_field_nullable(inner)))
+        }
+        ArrowDataType::LargeList(inner) => {
+            ArrowDataType::LargeList(Arc::new(make_field_nullable(inner)))
+        }
+        ArrowDataType::Map(inner, sorted) => {
+            ArrowDataType::Map(Arc::new(make_field_nullable(inner)), *sorted)
+        }
+        other => other.clone(),
+    };
+
+    Field::new(field.name(), new_data_type, true)
 }
 
 /// Build an Arrow schema with the `_source_file` column appended.
@@ -35,6 +73,19 @@ pub fn with_source_file_column(schema: &ArrowSchema) -> ArrowSchema {
         ArrowDataType::Utf8,
         false,
     )));
+    ArrowSchema::new(fields)
+}
+
+/// Remove the `_source_file` column from a schema.
+/// Used to get the schema for parsing source JSON files, which shouldn't include
+/// the metadata column we add after parsing.
+pub fn without_source_file_column(schema: &ArrowSchema) -> ArrowSchema {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .filter(|f| f.name() != SOURCE_FILE_COLUMN)
+        .cloned()
+        .collect();
     ArrowSchema::new(fields)
 }
 
