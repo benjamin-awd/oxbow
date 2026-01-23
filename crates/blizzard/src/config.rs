@@ -12,8 +12,6 @@ pub struct Config {
     pub poll_interval: u64,
     pub download_concurrency: usize,
     pub batch_size: usize,
-    pub schema_evolution: bool,
-    pub schema_sample_bytes: usize,
     /// Timeout in seconds for downloading and processing a single file (default: 300s)
     pub file_timeout_secs: u64,
     /// Maximum number of consecutive failures for a file before marking it as permanently failed (default: 3)
@@ -63,8 +61,6 @@ impl Config {
             poll_interval: parse_env_or("POLL_INTERVAL_SECS", 10),
             download_concurrency: parse_env_or("DOWNLOAD_CONCURRENCY", 50),
             batch_size: parse_env_or("BATCH_SIZE", 4096),
-            schema_evolution: std::env::var("SCHEMA_EVOLUTION").is_ok(),
-            schema_sample_bytes: parse_env_or("SCHEMA_SAMPLE_BYTES", 64 * 1024),
             file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
             max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
         }
@@ -76,8 +72,7 @@ impl fmt::Display for Config {
         write!(
             f,
             "bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, \
-             concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, \
-             file_timeout={}s, max_retries={}",
+             concurrency={}, batch_size={}, file_timeout={}s, max_retries={}",
             self.source_bucket,
             self.source_prefix,
             self.delta_table_uri,
@@ -86,8 +81,6 @@ impl fmt::Display for Config {
             self.poll_interval,
             self.download_concurrency,
             self.batch_size,
-            self.schema_evolution,
-            self.schema_sample_bytes,
             self.file_timeout_secs,
             self.max_file_retries
         )

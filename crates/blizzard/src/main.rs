@@ -24,10 +24,10 @@ use blizzard::read::{
     augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
     stream_and_parse_file,
 };
-use blizzard::schema::{self, try_detect_schema_evolution, with_source_file_column};
+use blizzard::schema;
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
 use blizzard::store::ObjectStoreResultExt;
-use blizzard::write::{commit_writer, commit_writer_with_schema_evolution};
+use blizzard::write::commit_writer;
 
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::kernel::schema::{DataType, StructField};
@@ -51,6 +51,9 @@ const FILE_BATCH_SIZE: usize = 100;
 
 /// Max age in seconds before health check considers service unhealthy
 const HEALTH_MAX_AGE_SECS: u64 = 300;
+
+/// Number of bytes to sample when inferring schema from a JSON file
+const SCHEMA_SAMPLE_BYTES: usize = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Error> {
@@ -193,8 +196,15 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         if batch.len() >= FILE_BATCH_SIZE {
             batch_num += 1;
             info!("Processing batch {} ({} files)", batch_num, batch.len());
-            let processed =
-                process_file_batch(&batch, &object_store, &arrow_schema, &mut table, &mut state, config).await?;
+            let processed = process_file_batch(
+                &batch,
+                &object_store,
+                &arrow_schema,
+                &mut table,
+                &mut state,
+                config,
+            )
+            .await?;
             total_processed += processed;
             batch.clear();
         }
@@ -208,8 +218,15 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         } else {
             info!("Processing {} files", batch.len());
         }
-        let processed =
-            process_file_batch(&batch, &object_store, &arrow_schema, &mut table, &mut state, config).await?;
+        let processed = process_file_batch(
+            &batch,
+            &object_store,
+            &arrow_schema,
+            &mut table,
+            &mut state,
+            config,
+        )
+        .await?;
         total_processed += processed;
     }
 
@@ -271,7 +288,7 @@ async fn create_table_from_json(
         object_store,
         &sample_file.location,
         is_compressed,
-        config.schema_sample_bytes,
+        SCHEMA_SAMPLE_BYTES,
     )
     .await?;
 
@@ -328,63 +345,18 @@ async fn process_file_batch(
 ) -> Result<usize> {
     let mut processed_paths: Vec<String> = Vec::new();
     let mut total_records: usize = 0;
-    let mut new_fields: Vec<StructField> = Vec::new();
-
-    // Check if _source_file column needs to be added to the table schema
-    let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
-    if table_schema.index_of(schema::SOURCE_FILE_COLUMN).is_none() {
-        info!(
-            "Adding {} column to table schema for atomic state tracking",
-            schema::SOURCE_FILE_COLUMN
-        );
-        new_fields.push(schema::source_file_field());
-    }
-
-    let parsing_schema = if config.schema_evolution
-        && let Some(first_file) = files.first()
-    {
-        let (schema, evolved_fields) = try_detect_schema_evolution(
-            object_store,
-            &first_file.location,
-            table,
-            arrow_schema,
-            config.schema_sample_bytes,
-        )
-        .await;
-        new_fields.extend(evolved_fields);
-        schema
-    } else {
-        Arc::clone(arrow_schema)
-    };
 
     let file_timeout = Duration::from_secs(config.file_timeout_secs);
     let max_retries = config.max_file_retries;
-    let needs_schema_evolution = !new_fields.is_empty();
 
-    // Build the writer schema: parsing_schema + _source_file column
-    let writer_schema = Arc::new(with_source_file_column(&parsing_schema));
-
-    // Create writer with appropriate schema - use try_new for evolved schema,
-    // for_table for non-evolution (simpler, handles storage options automatically)
-    let mut writer = if needs_schema_evolution {
-        RecordBatchWriter::try_new(
-            &config.delta_table_uri,
-            writer_schema,
-            None, // no partition columns
-            Some(std::collections::HashMap::new()),
-        )
+    let mut writer = RecordBatchWriter::for_table(table)
         .context(DeltaTableSnafu)?
-        .with_commit_properties(oxbow::default_commit_properties())
-    } else {
-        RecordBatchWriter::for_table(table)
-            .context(DeltaTableSnafu)?
-            .with_commit_properties(oxbow::default_commit_properties())
-    };
+        .with_commit_properties(oxbow::default_commit_properties());
 
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
             let store = Arc::clone(object_store);
-            let schema = Arc::clone(&parsing_schema);
+            let schema = Arc::clone(arrow_schema);
             let location = obj.location.clone();
             let size = obj.size;
             let batch_size = config.batch_size;
@@ -419,7 +391,6 @@ async fn process_file_batch(
                 for batch in batches {
                     match augment_with_source_file(batch, &file_path) {
                         Ok(augmented) => {
-                            // Stream directly to writer (works for both evolution and non-evolution)
                             if let Err(e) = writer.write(augmented).await {
                                 error!("Failed to write batch to Delta writer: {:?}", e);
                                 let write_error = Error::DeltaTable { source: e };
@@ -459,28 +430,16 @@ async fn process_file_batch(
     let files_processed = processed_paths.len();
 
     if has_batches {
-        let updated_table = if needs_schema_evolution {
-            // Schema evolution: flush writer and commit with metadata action
-            commit_writer_with_schema_evolution(table.clone(), writer, &new_fields).await?
-        } else {
-            // No evolution: simple commit
-            commit_writer(table.clone(), writer).await?
-        };
-        *table = updated_table;
+        *table = commit_writer(table.clone(), writer).await?;
 
         // Save state file for failure tracking (processed files are now tracked in Delta)
         save_state(&config.state_file_uri, state).await?;
 
         info!(
-            "Committed {} files ({} records) to Delta v{:?}{}",
+            "Committed {} files ({} records) to Delta v{:?}",
             files_processed,
             total_records,
             table.version(),
-            if !new_fields.is_empty() {
-                format!(" (schema evolved with {} new fields)", new_fields.len())
-            } else {
-                String::new()
-            }
         );
 
         archive_processed_files(object_store, &processed_paths).await;
@@ -497,7 +456,10 @@ async fn archive_processed_files(object_store: &Arc<dyn ObjectStore>, paths: &[S
             Err(Error::ObjectStore {
                 source: ObjectStoreError::NotFound { .. },
             }) => {
-                debug!("File {} already gone during archive, treating as success", path);
+                debug!(
+                    "File {} already gone during archive, treating as success",
+                    path
+                );
                 archived += 1;
             }
             Err(e) => {
