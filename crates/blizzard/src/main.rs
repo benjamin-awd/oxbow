@@ -31,7 +31,11 @@ use blizzard::schema::{
 };
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
 
-use deltalake::ObjectStore;
+use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
+use deltalake::kernel::schema::{DataType, StructField};
+use deltalake::operations::create::CreateBuilder;
+use deltalake::protocol::SaveMode;
+use deltalake::{DeltaTableError, ObjectStore};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,15 +121,57 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     let list_prefix = (!config.source_prefix.is_empty())
         .then(|| deltalake::Path::from(config.source_prefix.as_str()));
 
-    let mut listing = object_store.list(list_prefix.as_ref());
-    let mut new_files = Vec::with_capacity(FILE_BATCH_SIZE);
+    // First, collect all candidate files from the bucket
+    // We need to do this before opening the table so we have files available
+    // for schema inference if the table doesn't exist yet
+    let mut candidate_files: Vec<deltalake::ObjectMeta> = Vec::new();
     let mut total_listed = 0usize;
-    let mut total_processed = 0usize;
 
-    // Open delta table and query for already-processed files
-    let mut table = oxbow::lock::open_table(&config.delta_table_uri)
-        .await
-        .context(DeltaTableSnafu)?;
+    let mut listing = object_store.list(list_prefix.as_ref());
+    while let Some(result) = listing.next().await {
+        let obj = result.map_err(|e| {
+            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
+        })?;
+        total_listed += 1;
+
+        let name = obj.location.as_ref();
+
+        // Skip archived files
+        if name.starts_with(ARCHIVE_PREFIX) {
+            continue;
+        }
+
+        // Collect supported JSON files that haven't permanently failed
+        if is_supported_json_file(name) && !state.is_permanently_failed(name) {
+            candidate_files.push(obj);
+        }
+    }
+
+    // If no candidate files, nothing to do
+    if candidate_files.is_empty() {
+        debug!("No candidate files to process ({} listed)", total_listed);
+        return Ok(());
+    }
+
+    // Try to open the Delta table, creating it if it doesn't exist
+    let mut table = match oxbow::lock::open_table(&config.delta_table_uri).await {
+        Ok(table) => table,
+        Err(DeltaTableError::NotATable(_)) => {
+            info!(
+                "Delta table does not exist at {}, creating from first JSON file",
+                config.delta_table_uri
+            );
+            create_table_from_json(
+                &config.delta_table_uri,
+                &object_store,
+                &candidate_files[0],
+                config,
+            )
+            .await?
+        }
+        Err(e) => return Err(Error::DeltaTable { source: e }),
+    };
+
     let arrow_schema = table
         .snapshot()
         .context(DeltaTableSnafu)?
@@ -143,60 +189,33 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         );
     }
 
-    while let Some(result) = listing.next().await {
-        let obj = result.map_err(|e| {
-            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
-        })?;
-        total_listed += 1;
+    // Filter out already-processed files
+    let new_files: Vec<deltalake::ObjectMeta> = candidate_files
+        .into_iter()
+        .filter(|obj| !delta_processed_files.contains(obj.location.as_ref()))
+        .collect();
 
-        let name = obj.location.as_ref();
-
-        // Skip archived files
-        if name.starts_with(ARCHIVE_PREFIX) {
-            continue;
-        }
-
-        if is_supported_json_file(name)
-            && !delta_processed_files.contains(name)
-            && !state.is_permanently_failed(name)
-        {
-            new_files.push(obj);
-        }
-
-        // Process batch when full
-        if new_files.len() >= FILE_BATCH_SIZE {
-            let batch_num = total_processed / FILE_BATCH_SIZE + 1;
-            info!(
-                "Processing batch {} ({} files, {} listed so far)",
-                batch_num,
-                new_files.len(),
-                total_listed
-            );
-
-            let processed = process_file_batch(
-                &new_files,
-                &object_store,
-                &arrow_schema,
-                &mut table,
-                &mut state,
-                config,
-            )
-            .await?;
-
-            total_processed += processed;
-            new_files.clear();
-        }
+    if new_files.is_empty() {
+        debug!(
+            "No new files to process ({} listed, {} already processed)",
+            total_listed,
+            delta_processed_files.len()
+        );
+        return Ok(());
     }
 
-    if !new_files.is_empty() {
-        info!(
-            "Processing final batch ({} files, {} total listed)",
-            new_files.len(),
-            total_listed
-        );
+    // Process files in batches
+    let mut total_processed = 0usize;
+
+    for (batch_idx, batch) in new_files.chunks(FILE_BATCH_SIZE).enumerate() {
+        if batch_idx > 0 || batch.len() >= FILE_BATCH_SIZE {
+            info!("Processing batch {} ({} files)", batch_idx + 1, batch.len());
+        } else {
+            info!("Processing {} files", batch.len());
+        }
 
         let processed = process_file_batch(
-            &new_files,
+            batch,
             &object_store,
             &arrow_schema,
             &mut table,
@@ -218,6 +237,71 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create a new Delta table by inferring schema from a JSON file.
+///
+/// This function samples the schema from the first JSON file and creates a Delta table
+/// with the inferred schema plus the `_source_file` column for tracking.
+async fn create_table_from_json(
+    table_uri: &str,
+    object_store: &Arc<dyn ObjectStore>,
+    sample_file: &deltalake::ObjectMeta,
+    config: &Config,
+) -> Result<deltalake::DeltaTable> {
+    use deltalake::logstore::{StorageConfig, logstore_for};
+    use snafu::ResultExt;
+
+    let file_path = sample_file.location.as_ref();
+    let is_compressed = is_gzip_compressed(file_path);
+
+    info!("Inferring schema from {} to create Delta table", file_path);
+
+    // Sample schema from JSON file
+    let arrow_schema = sample_schema_from_file(
+        object_store,
+        &sample_file.location,
+        is_compressed,
+        config.schema_sample_bytes,
+    )
+    .await?;
+
+    // Convert Arrow fields to Delta StructFields
+    let mut columns: Vec<StructField> = Vec::new();
+    for field in arrow_schema.fields() {
+        let coerced = oxbow::coerce_field(field.clone());
+        if let Ok(delta_type) = DataType::try_from_arrow(coerced.data_type()) {
+            columns.push(StructField::new(field.name().to_string(), delta_type, true));
+        } else {
+            warn!(
+                "Could not convert field {} to Delta type, skipping",
+                field.name()
+            );
+        }
+    }
+
+    // Add _source_file column for atomic state tracking
+    columns.push(schema::source_file_field());
+
+    info!(
+        "Creating Delta table with {} columns inferred from {}",
+        columns.len(),
+        file_path
+    );
+
+    // Create the table
+    let table_url = Url::parse(table_uri).context(UrlParseSnafu { url: table_uri })?;
+    let store = logstore_for(&table_url, StorageConfig::default()).context(DeltaTableSnafu)?;
+
+    let table = CreateBuilder::new()
+        .with_log_store(store)
+        .with_columns(columns)
+        .with_save_mode(SaveMode::Ignore)
+        .await
+        .context(DeltaTableSnafu)?;
+
+    info!("Created Delta table at {}", table_uri);
+    Ok(table)
 }
 
 async fn process_file_batch(

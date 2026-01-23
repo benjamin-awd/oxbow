@@ -2,3 +2,6 @@
 
 #[path = "integration/source_file_tracking.rs"]
 mod source_file_tracking;
+
+#[path = "integration/table_creation.rs"]
+mod table_creation;
