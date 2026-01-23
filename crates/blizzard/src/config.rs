@@ -17,8 +17,6 @@ pub struct Config {
     pub file_timeout_secs: u64,
     /// Maximum number of consecutive failures for a file before marking it as permanently failed (default: 3)
     pub max_file_retries: usize,
-    /// Number of files to collect before processing a chunk (default: 10,000)
-    pub file_listing_chunk_size: usize,
 }
 
 fn parse_env_or<T: std::str::FromStr>(key: &str, default: T) -> T
@@ -68,7 +66,6 @@ impl Config {
             schema_sample_bytes: parse_env_or("SCHEMA_SAMPLE_BYTES", 64 * 1024),
             file_timeout_secs: parse_env_or("FILE_TIMEOUT_SECS", 300),
             max_file_retries: parse_env_or("MAX_FILE_RETRIES", 3),
-            file_listing_chunk_size: parse_env_or("FILE_LISTING_CHUNK_SIZE", 10_000),
         }
     }
 }

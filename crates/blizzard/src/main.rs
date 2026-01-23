@@ -66,7 +66,7 @@ async fn main() -> std::result::Result<(), Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}, file_listing_chunk_size={}",
+        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
@@ -78,8 +78,7 @@ async fn main() -> std::result::Result<(), Error> {
         config.schema_evolution,
         config.schema_sample_bytes,
         config.file_timeout_secs,
-        config.max_file_retries,
-        config.file_listing_chunk_size
+        config.max_file_retries
     );
 
     // Start health check server with heartbeat tracking
@@ -168,18 +167,17 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         );
     }
 
-    // Process files in chunks to bound memory usage
-    let chunk_size = config.file_listing_chunk_size;
-    let mut chunk: Vec<deltalake::ObjectMeta> = Vec::with_capacity(chunk_size);
+    // Process files in batches as we stream the listing
+    let mut batch: Vec<deltalake::ObjectMeta> = Vec::with_capacity(FILE_BATCH_SIZE);
     let mut total_processed = 0usize;
     let mut total_listed = 0usize;
-    let mut chunk_idx = 0usize;
+    let mut batch_num = 0usize;
 
-    // Add the first file to the chunk if it wasn't already processed
+    // Add the first file to the batch if it wasn't already processed
     if let Some(f) = first_file {
         total_listed += 1;
         if !delta_processed_files.contains(f.location.as_ref()) {
-            chunk.push(f);
+            batch.push(f);
         }
     }
 
@@ -202,39 +200,30 @@ async fn poll_and_process(config: &Config) -> Result<()> {
             && !state.is_permanently_failed(name)
             && !delta_processed_files.contains(name)
         {
-            chunk.push(obj);
+            batch.push(obj);
         }
 
-        // Process chunk when it reaches the configured size
-        if chunk.len() >= chunk_size {
-            let processed = process_chunk(
-                &chunk,
-                chunk_idx,
-                &object_store,
-                &arrow_schema,
-                &mut table,
-                &mut state,
-                config,
-            )
-            .await?;
+        // Process batch when it reaches FILE_BATCH_SIZE
+        if batch.len() >= FILE_BATCH_SIZE {
+            batch_num += 1;
+            info!("Processing batch {} ({} files)", batch_num, batch.len());
+            let processed =
+                process_file_batch(&batch, &object_store, &arrow_schema, &mut table, &mut state, config).await?;
             total_processed += processed;
-            chunk.clear();
-            chunk_idx += 1;
+            batch.clear();
         }
     }
 
-    // Process remaining files in the final chunk
-    if !chunk.is_empty() {
-        let processed = process_chunk(
-            &chunk,
-            chunk_idx,
-            &object_store,
-            &arrow_schema,
-            &mut table,
-            &mut state,
-            config,
-        )
-        .await?;
+    // Process remaining files in the final batch
+    if !batch.is_empty() {
+        if batch_num > 0 {
+            batch_num += 1;
+            info!("Processing batch {} ({} files)", batch_num, batch.len());
+        } else {
+            info!("Processing {} files", batch.len());
+        }
+        let processed =
+            process_file_batch(&batch, &object_store, &arrow_schema, &mut table, &mut state, config).await?;
         total_processed += processed;
     }
 
@@ -274,40 +263,6 @@ async fn peek_first_valid_file(
         }
     }
     Ok(None)
-}
-
-/// Process a chunk of files, breaking them into smaller batches for Delta commits.
-async fn process_chunk(
-    chunk: &[deltalake::ObjectMeta],
-    chunk_idx: usize,
-    object_store: &Arc<dyn ObjectStore>,
-    arrow_schema: &Arc<deltalake::arrow::datatypes::Schema>,
-    table: &mut deltalake::DeltaTable,
-    state: &mut ProcessedState,
-    config: &Config,
-) -> Result<usize> {
-    let mut chunk_processed = 0usize;
-
-    for (batch_idx, batch) in chunk.chunks(FILE_BATCH_SIZE).enumerate() {
-        let global_batch_idx =
-            chunk_idx * (config.file_listing_chunk_size / FILE_BATCH_SIZE) + batch_idx;
-        if global_batch_idx > 0 || batch.len() >= FILE_BATCH_SIZE {
-            info!(
-                "Processing batch {} ({} files)",
-                global_batch_idx + 1,
-                batch.len()
-            );
-        } else {
-            info!("Processing {} files", batch.len());
-        }
-
-        let processed =
-            process_file_batch(batch, object_store, arrow_schema, table, state, config).await?;
-
-        chunk_processed += processed;
-    }
-
-    Ok(chunk_processed)
 }
 
 /// Create a new Delta table by inferring schema from a JSON file.
