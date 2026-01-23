@@ -69,9 +69,9 @@ variable "file_loader_state_file_path" {
 }
 
 variable "file_loader_image" {
-  description = "Container image for file-loader"
+  description = "Container image"
   type        = string
-  default     = "asia-northeast1-docker.pkg.dev/data-dev-596660/main-asia/oxbow/file-loader:latest"
+  default     = "asia-northeast1-docker.pkg.dev/data-dev-596660/main-asia/oxbow/blizzard:latest"
 }
 
 variable "file_loader_poll_interval_secs" {

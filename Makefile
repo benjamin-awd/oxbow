@@ -28,20 +28,20 @@ clean: ## Clean up resources from build
 
 REGISTRY ?= asia-northeast1-docker.pkg.dev/data-dev-596660/oxbow
 
-.PHONY: docker-build-file-loader docker-push-file-loader
-docker-build-file-loader: ## Build file-loader Docker image for linux/amd64
+.PHONY: docker-build-blizzard docker-push-blizzard
+docker-build-blizzard: ## Build blizzard Docker image for linux/amd64
 	docker buildx build \
 		--platform linux/amd64 \
-		-t $(REGISTRY)/file-loader:latest \
-		-f cloudrun/file-loader/Dockerfile \
+		-t $(REGISTRY)/blizzard:latest \
+		-f cloudrun/blizzard/Dockerfile \
 		.
 
-docker-push-file-loader: ## Build and push file-loader Docker image with registry cache
+docker-push-blizzard: ## Build and push blizzard Docker image with registry cache
 	docker buildx build \
 		--platform linux/amd64 \
-		-t $(REGISTRY)/file-loader:latest \
-		-f cloudrun/file-loader/Dockerfile \
-		--cache-from type=registry,ref=$(REGISTRY)/file-loader:cache \
-		--cache-to type=registry,ref=$(REGISTRY)/file-loader:cache,mode=max \
+		-t $(REGISTRY)/blizzard:latest \
+		-f cloudrun/blizzard/Dockerfile \
+		--cache-from type=registry,ref=$(REGISTRY)/blizzard:cache \
+		--cache-to type=registry,ref=$(REGISTRY)/blizzard:cache,mode=max \
 		--push \
 		.
