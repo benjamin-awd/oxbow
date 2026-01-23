@@ -24,7 +24,7 @@ use blizzard::read::{
     augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
     stream_and_parse_file,
 };
-use blizzard::schema::{self, evolve_schema, with_source_file_column};
+use blizzard::schema::{self, try_detect_schema_evolution, with_source_file_column};
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
 use blizzard::store::ObjectStoreResultExt;
 use blizzard::write::{commit_writer, commit_writer_with_schema_evolution};
@@ -399,47 +399,19 @@ async fn process_file_batch(
         new_fields.push(schema::source_file_field());
     }
 
-    let parsing_schema: Arc<deltalake::arrow::datatypes::Schema> = if config.schema_evolution {
-        // Sample schema from first file to detect new fields
-        if let Some(first_file) = files.first() {
-            let file_path = first_file.location.as_ref();
-            let is_compressed = is_gzip_compressed(file_path);
-
-            match sample_schema_from_file(
-                object_store,
-                &first_file.location,
-                is_compressed,
-                config.schema_sample_bytes,
-            )
-            .await
-            {
-                Ok(file_schema) => match evolve_schema(table, arrow_schema, &file_schema) {
-                    Ok(Some((file_new_fields, merged))) => {
-                        info!(
-                            "Schema evolution: {} new fields from {}",
-                            file_new_fields.len(),
-                            file_path
-                        );
-                        new_fields.extend(file_new_fields);
-                        merged
-                    }
-                    Ok(None) => Arc::clone(arrow_schema),
-                    Err(e) => {
-                        warn!("Schema evolution check failed: {:?}, using table schema", e);
-                        Arc::clone(arrow_schema)
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        "Failed to sample schema from {}: {:?}, using table schema",
-                        file_path, e
-                    );
-                    Arc::clone(arrow_schema)
-                }
-            }
-        } else {
-            Arc::clone(arrow_schema)
-        }
+    let parsing_schema = if config.schema_evolution
+        && let Some(first_file) = files.first()
+    {
+        let (schema, evolved_fields) = try_detect_schema_evolution(
+            object_store,
+            &first_file.location,
+            table,
+            arrow_schema,
+            config.schema_sample_bytes,
+        )
+        .await;
+        new_fields.extend(evolved_fields);
+        schema
     } else {
         Arc::clone(arrow_schema)
     };

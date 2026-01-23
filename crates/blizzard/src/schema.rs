@@ -4,7 +4,9 @@
 //! and evolve the Delta table schema to accommodate them.
 
 use crate::error::{DeltaTableSnafu, Result, SchemaInferenceSnafu};
+use crate::read::{is_gzip_compressed, sample_schema_from_file};
 use deltalake::DeltaTable;
+use deltalake::ObjectStore;
 use deltalake::arrow::datatypes::{Field, Schema as ArrowSchema};
 use deltalake::arrow::json::reader::infer_json_schema_from_seekable;
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
@@ -156,6 +158,50 @@ pub fn evolve_schema(
         Ok(Some((new_fields, Arc::new(merged))))
     } else {
         Ok(None)
+    }
+}
+
+/// Detect schema evolution by sampling a file and comparing against the table schema.
+///
+/// Returns the schema to use for parsing and any new fields that need to be added.
+/// On any error, logs a warning and returns the original schema with no new fields.
+pub async fn try_detect_schema_evolution(
+    object_store: &Arc<dyn ObjectStore>,
+    file_path: &deltalake::Path,
+    table: &DeltaTable,
+    current_arrow_schema: &Arc<ArrowSchema>,
+    schema_sample_bytes: usize,
+) -> (Arc<ArrowSchema>, Vec<StructField>) {
+    let is_compressed = is_gzip_compressed(file_path.as_ref());
+
+    let file_schema =
+        match sample_schema_from_file(object_store, file_path, is_compressed, schema_sample_bytes)
+            .await
+        {
+            Ok(schema) => schema,
+            Err(e) => {
+                warn!(
+                    "Failed to sample schema from {}: {:?}, using table schema",
+                    file_path, e
+                );
+                return (Arc::clone(current_arrow_schema), Vec::new());
+            }
+        };
+
+    match evolve_schema(table, current_arrow_schema, &file_schema) {
+        Ok(Some((new_fields, merged))) => {
+            info!(
+                "Schema evolution: {} new fields from {}",
+                new_fields.len(),
+                file_path
+            );
+            (merged, new_fields)
+        }
+        Ok(None) => (Arc::clone(current_arrow_schema), Vec::new()),
+        Err(e) => {
+            warn!("Schema evolution check failed: {:?}, using table schema", e);
+            (Arc::clone(current_arrow_schema), Vec::new())
+        }
     }
 }
 
