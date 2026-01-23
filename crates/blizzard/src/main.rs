@@ -26,13 +26,18 @@ use blizzard::read::{
 };
 use blizzard::schema::{self, create_metadata_action, evolve_schema, with_source_file_column};
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
+use blizzard::store::ObjectStoreResultExt;
 
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
 use deltalake::kernel::schema::{DataType, StructField};
+use deltalake::kernel::transaction::CommitBuilder;
+use deltalake::logstore::{logstore_for, StorageConfig};
 use deltalake::operations::create::CreateBuilder;
-use deltalake::protocol::SaveMode;
+use deltalake::protocol::{DeltaOperation, SaveMode};
+use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
 use deltalake::{DeltaTableError, ObjectStore};
 use futures::StreamExt;
+use snafu::ResultExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::*;
@@ -40,6 +45,12 @@ use url::Url;
 
 /// Prefix where processed files are moved to
 const ARCHIVE_PREFIX: &str = "processed/";
+
+/// Number of files to process in a single Delta commit
+const FILE_BATCH_SIZE: usize = 100;
+
+/// Max age in seconds before health check considers service unhealthy
+const HEALTH_MAX_AGE_SECS: u64 = 300;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Error> {
@@ -72,8 +83,7 @@ async fn main() -> std::result::Result<(), Error> {
     );
 
     // Start health check server with heartbeat tracking
-    // Consider unhealthy if no heartbeat for 5 minutes
-    let heartbeat = health::Heartbeat::new(300);
+    let heartbeat = health::Heartbeat::new(HEALTH_MAX_AGE_SECS);
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
     health::spawn_health_server(addr, heartbeat.clone());
@@ -97,9 +107,6 @@ async fn main() -> std::result::Result<(), Error> {
 }
 
 async fn poll_and_process(config: &Config) -> Result<()> {
-    use deltalake::logstore::{StorageConfig, logstore_for};
-    use snafu::ResultExt;
-
     debug!(
         "Polling gs://{}/{} for new files",
         config.source_bucket, config.source_prefix
@@ -279,8 +286,6 @@ async fn process_chunk(
     state: &mut ProcessedState,
     config: &Config,
 ) -> Result<usize> {
-    const FILE_BATCH_SIZE: usize = 100;
-
     let mut chunk_processed = 0usize;
 
     for (batch_idx, batch) in chunk.chunks(FILE_BATCH_SIZE).enumerate() {
@@ -315,9 +320,6 @@ async fn create_table_from_json(
     sample_file: &deltalake::ObjectMeta,
     config: &Config,
 ) -> Result<deltalake::DeltaTable> {
-    use deltalake::logstore::{StorageConfig, logstore_for};
-    use snafu::ResultExt;
-
     let file_path = sample_file.location.as_ref();
     let is_compressed = is_gzip_compressed(file_path);
 
@@ -383,10 +385,6 @@ async fn process_file_batch(
     state: &mut ProcessedState,
     config: &Config,
 ) -> Result<usize> {
-    use deltalake::kernel::StructField;
-    use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
-    use snafu::ResultExt;
-
     let mut processed_paths: Vec<String> = Vec::new();
     let mut total_records: usize = 0;
     let mut new_fields: Vec<StructField> = Vec::new();
@@ -602,11 +600,8 @@ async fn process_file_batch(
 /// Commit a writer that already has data written to it (no schema evolution).
 async fn commit_writer(
     mut table: deltalake::DeltaTable,
-    mut writer: deltalake::writer::record_batch::RecordBatchWriter,
+    mut writer: RecordBatchWriter,
 ) -> Result<deltalake::DeltaTable> {
-    use deltalake::writer::DeltaWriter;
-    use snafu::ResultExt;
-
     writer
         .flush_and_commit(&mut table)
         .await
@@ -617,14 +612,9 @@ async fn commit_writer(
 /// Commit a writer with schema evolution - flush and commit with metadata action.
 async fn commit_writer_with_schema_evolution(
     mut table: deltalake::DeltaTable,
-    mut writer: deltalake::writer::record_batch::RecordBatchWriter,
-    new_fields: &[deltalake::kernel::StructField],
+    mut writer: RecordBatchWriter,
+    new_fields: &[StructField],
 ) -> Result<deltalake::DeltaTable> {
-    use deltalake::kernel::transaction::CommitBuilder;
-    use deltalake::protocol::DeltaOperation;
-    use deltalake::writer::DeltaWriter;
-    use snafu::ResultExt;
-
     let metadata_action = create_metadata_action(&table, new_fields)?;
 
     // Flush to get add actions without committing
@@ -671,11 +661,11 @@ async fn archive_file(
     object_store
         .copy(&from, &to)
         .await
-        .map_err(|e| ObjectStoreError::from_source(e, source_path))?;
+        .with_path_context(source_path)?;
     object_store
         .delete(&from)
         .await
-        .map_err(|e| ObjectStoreError::from_source(e, source_path))?;
+        .with_path_context(source_path)?;
 
     debug!("Archived {} -> {}", source_path, archive_path);
     Ok(())
