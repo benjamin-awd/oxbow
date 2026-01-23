@@ -24,9 +24,7 @@ use blizzard::read::{
     augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
     stream_and_parse_file,
 };
-use blizzard::schema::{
-    self, create_merged_arrow_schema, create_metadata_action, merge_schemas, needs_evolution,
-};
+use blizzard::schema::{self, create_metadata_action, evolve_schema, with_source_file_column};
 use blizzard::state::{ProcessedState, load_state, query_processed_files, save_state};
 
 use deltalake::kernel::engine::arrow_conversion::TryFromArrow;
@@ -140,13 +138,8 @@ async fn poll_and_process(config: &Config) -> Result<()> {
                 "Delta table does not exist at {}, creating from first JSON file",
                 config.delta_table_uri
             );
-            create_table_from_json(
-                &config.delta_table_uri,
-                &object_store,
-                sample_file,
-                config,
-            )
-            .await?
+            create_table_from_json(&config.delta_table_uri, &object_store, sample_file, config)
+                .await?
         }
         Err(e) => return Err(Error::DeltaTable { source: e }),
     };
@@ -291,7 +284,8 @@ async fn process_chunk(
     let mut chunk_processed = 0usize;
 
     for (batch_idx, batch) in chunk.chunks(FILE_BATCH_SIZE).enumerate() {
-        let global_batch_idx = chunk_idx * (config.file_listing_chunk_size / FILE_BATCH_SIZE) + batch_idx;
+        let global_batch_idx =
+            chunk_idx * (config.file_listing_chunk_size / FILE_BATCH_SIZE) + batch_idx;
         if global_batch_idx > 0 || batch.len() >= FILE_BATCH_SIZE {
             info!(
                 "Processing batch {} ({} files)",
@@ -302,15 +296,8 @@ async fn process_chunk(
             info!("Processing {} files", batch.len());
         }
 
-        let processed = process_file_batch(
-            batch,
-            object_store,
-            arrow_schema,
-            table,
-            state,
-            config,
-        )
-        .await?;
+        let processed =
+            process_file_batch(batch, object_store, arrow_schema, table, state, config).await?;
 
         chunk_processed += processed;
     }
@@ -428,22 +415,22 @@ async fn process_file_batch(
             )
             .await
             {
-                Ok(file_schema) => {
-                    let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
-                    if needs_evolution(&table_schema, &file_schema) {
-                        let file_new_fields = merge_schemas(&table_schema, &file_schema);
-                        let merged = create_merged_arrow_schema(arrow_schema, &file_schema);
+                Ok(file_schema) => match evolve_schema(table, arrow_schema, &file_schema) {
+                    Ok(Some((file_new_fields, merged))) => {
                         info!(
-                            "Schema evolution detected: {} new fields from {}",
+                            "Schema evolution: {} new fields from {}",
                             file_new_fields.len(),
                             file_path
                         );
                         new_fields.extend(file_new_fields);
-                        Arc::new(merged)
-                    } else {
+                        merged
+                    }
+                    Ok(None) => Arc::clone(arrow_schema),
+                    Err(e) => {
+                        warn!("Schema evolution check failed: {:?}, using table schema", e);
                         Arc::clone(arrow_schema)
                     }
-                }
+                },
                 Err(e) => {
                     warn!(
                         "Failed to sample schema from {}: {:?}, using table schema",
@@ -459,13 +446,29 @@ async fn process_file_batch(
         Arc::clone(arrow_schema)
     };
 
-    // Create writer upfront - batches will be written as they're parsed
-    let mut writer = RecordBatchWriter::for_table(&table)
-        .context(DeltaTableSnafu)?
-        .with_commit_properties(oxbow::default_commit_properties());
-
     let file_timeout = Duration::from_secs(config.file_timeout_secs);
     let max_retries = config.max_file_retries;
+    let needs_schema_evolution = !new_fields.is_empty();
+
+    // Build the writer schema: parsing_schema + _source_file column
+    let writer_schema = Arc::new(with_source_file_column(&parsing_schema));
+
+    // Create writer with appropriate schema - use try_new for evolved schema,
+    // for_table for non-evolution (simpler, handles storage options automatically)
+    let mut writer = if needs_schema_evolution {
+        RecordBatchWriter::try_new(
+            &config.delta_table_uri,
+            writer_schema,
+            None, // no partition columns
+            Some(std::collections::HashMap::new()),
+        )
+        .context(DeltaTableSnafu)?
+        .with_commit_properties(oxbow::default_commit_properties())
+    } else {
+        RecordBatchWriter::for_table(table)
+            .context(DeltaTableSnafu)?
+            .with_commit_properties(oxbow::default_commit_properties())
+    };
 
     let mut stream = futures::stream::iter(files)
         .map(|obj| {
@@ -501,11 +504,11 @@ async fn process_file_batch(
         match result {
             Ok(Ok((batches, records))) => {
                 info!("Parsed {} records from {}", records, file_path);
-                // Write each batch directly to the writer (streaming, no accumulation)
                 let mut file_success = true;
                 for batch in batches {
                     match augment_with_source_file(batch, &file_path) {
                         Ok(augmented) => {
+                            // Stream directly to writer (works for both evolution and non-evolution)
                             if let Err(e) = writer.write(augmented).await {
                                 error!("Failed to write batch to Delta writer: {:?}", e);
                                 let write_error = Error::DeltaTable { source: e };
@@ -545,9 +548,11 @@ async fn process_file_batch(
     let files_processed = processed_paths.len();
 
     if has_batches {
-        let updated_table = if !new_fields.is_empty() {
+        let updated_table = if needs_schema_evolution {
+            // Schema evolution: flush writer and commit with metadata action
             commit_writer_with_schema_evolution(table.clone(), writer, &new_fields).await?
         } else {
+            // No evolution: simple commit
             commit_writer(table.clone(), writer).await?
         };
         *table = updated_table;
@@ -602,11 +607,14 @@ async fn commit_writer(
     use deltalake::writer::DeltaWriter;
     use snafu::ResultExt;
 
-    writer.flush_and_commit(&mut table).await.context(DeltaTableSnafu)?;
+    writer
+        .flush_and_commit(&mut table)
+        .await
+        .context(DeltaTableSnafu)?;
     Ok(table)
 }
 
-/// Commit a writer that already has data written to it, with schema evolution.
+/// Commit a writer with schema evolution - flush and commit with metadata action.
 async fn commit_writer_with_schema_evolution(
     mut table: deltalake::DeltaTable,
     mut writer: deltalake::writer::record_batch::RecordBatchWriter,

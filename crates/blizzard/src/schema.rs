@@ -3,6 +3,7 @@
 //! This module provides functionality to detect new fields in JSON files
 //! and evolve the Delta table schema to accommodate them.
 
+use crate::error::{DeltaTableSnafu, Result, SchemaInferenceSnafu};
 use deltalake::DeltaTable;
 use deltalake::arrow::datatypes::{Field, Schema as ArrowSchema};
 use deltalake::arrow::json::reader::infer_json_schema_from_seekable;
@@ -15,8 +16,6 @@ use std::io::Cursor;
 use std::sync::Arc;
 use tracing::log::*;
 
-use crate::error::{DeltaTableSnafu, Result, SchemaInferenceSnafu};
-
 /// Column name for tracking source file origin
 pub const SOURCE_FILE_COLUMN: &str = "_source_file";
 
@@ -25,6 +24,7 @@ pub fn source_file_field() -> StructField {
     StructField::new(SOURCE_FILE_COLUMN.to_string(), DataType::STRING, false)
 }
 
+/// Infer an Arrow schema from a JSON sample
 pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema> {
     let cursor = Cursor::new(sample);
     let (schema, _) =
@@ -32,35 +32,37 @@ pub fn infer_schema_from_json_sample(sample: &[u8]) -> Result<ArrowSchema> {
     Ok(schema)
 }
 
-pub fn needs_evolution(table_schema: &Schema, file_schema: &ArrowSchema) -> bool {
-    for field in file_schema.fields() {
-        if table_schema.index_of(field.name()).is_none() {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn merge_schemas(table_schema: &Schema, file_schema: &ArrowSchema) -> Vec<StructField> {
-    let mut new_fields = Vec::new();
-
-    for field in file_schema.fields() {
-        let name = field.name();
-        if table_schema.index_of(name).is_none() {
-            debug!("Found new field for schema evolution: {name}");
+/// Detect new fields that need to be added to the table schema.
+/// Returns `Some(fields)` if evolution is needed, `None` otherwise.
+pub fn detect_new_fields(
+    table_schema: &Schema,
+    file_schema: &ArrowSchema,
+) -> Option<Vec<StructField>> {
+    let new_fields: Vec<StructField> = file_schema
+        .fields()
+        .iter()
+        .filter(|field| table_schema.index_of(field.name()).is_none())
+        .filter_map(|field| {
+            let name = field.name();
             let coerced = oxbow::coerce_field(field.clone());
-            if let Ok(delta_type) = deltalake::kernel::DataType::try_from_arrow(coerced.data_type())
-            {
-                new_fields.push(StructField::new(name.to_string(), delta_type, true));
-            } else {
-                warn!("Could not convert field {name} to Delta type, skipping");
+            match DataType::try_from_arrow(coerced.data_type()) {
+                Ok(delta_type) => {
+                    debug!("Found new field for schema evolution: {name}");
+                    Some(StructField::new(name.to_string(), delta_type, true))
+                }
+                Err(_) => {
+                    warn!("Could not convert field {name} to Delta type, skipping");
+                    None
+                }
             }
-        }
-    }
+        })
+        .collect();
 
-    new_fields
+    (!new_fields.is_empty()).then_some(new_fields)
 }
 
+/// Create a merged Arrow schema combining table schema with new fields from file schema.
+/// New fields are made nullable for backwards compatibility.
 pub fn create_merged_arrow_schema(
     table_schema: &ArrowSchema,
     file_schema: &ArrowSchema,
@@ -71,7 +73,6 @@ pub fn create_merged_arrow_schema(
         let name = field.name();
         if table_schema.field_with_name(name).is_err() {
             let coerced = oxbow::coerce_field(field.clone());
-            // Make new fields nullable for backwards compatibility
             let nullable_field = Arc::new(Field::new(
                 coerced.name(),
                 coerced.data_type().clone(),
@@ -84,6 +85,7 @@ pub fn create_merged_arrow_schema(
     ArrowSchema::new_with_metadata(fields, table_schema.metadata.clone())
 }
 
+/// Create a metadata action for schema evolution with the given new fields.
 pub fn create_metadata_action(table: &DeltaTable, new_fields: &[StructField]) -> Result<Action> {
     let snapshot = table.snapshot().context(DeltaTableSnafu)?;
     let table_schema = snapshot.schema();
@@ -125,6 +127,38 @@ pub fn create_metadata_action(table: &DeltaTable, new_fields: &[StructField]) ->
     Ok(Action::Metadata(action))
 }
 
+/// Build an Arrow schema with the `_source_file` column appended.
+/// This is the schema used for writing batches after augmenting with source file info.
+pub fn with_source_file_column(schema: &ArrowSchema) -> ArrowSchema {
+    use deltalake::arrow::datatypes::DataType as ArrowDataType;
+
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(
+        SOURCE_FILE_COLUMN,
+        ArrowDataType::Utf8,
+        false,
+    )));
+    ArrowSchema::new(fields)
+}
+
+/// High-level function to handle schema evolution.
+/// Returns the new fields and merged Arrow schema if evolution is needed.
+pub fn evolve_schema(
+    table: &DeltaTable,
+    current_arrow_schema: &ArrowSchema,
+    file_schema: &ArrowSchema,
+) -> Result<Option<(Vec<StructField>, Arc<ArrowSchema>)>> {
+    let table_schema = table.snapshot().context(DeltaTableSnafu)?.schema();
+
+    if let Some(new_fields) = detect_new_fields(&table_schema, file_schema) {
+        let merged = create_merged_arrow_schema(current_arrow_schema, file_schema);
+        info!("Schema evolution detected: {} new fields", new_fields.len());
+        Ok(Some((new_fields, Arc::new(merged))))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_evolution_with_new_field() {
+    fn test_detect_new_fields_with_new_field() {
         let table_schema = Schema::try_new(vec![StructField::new(
             "id".to_string(),
             DataType::LONG,
@@ -156,11 +190,17 @@ mod tests {
 
         let file_schema = infer_schema_from_json_sample(sample_json()).unwrap();
 
-        assert!(needs_evolution(&table_schema, &file_schema));
+        let new_fields = detect_new_fields(&table_schema, &file_schema);
+        assert!(new_fields.is_some());
+        let new_fields = new_fields.unwrap();
+        assert_eq!(new_fields.len(), 2);
+        let field_names: Vec<&str> = new_fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(field_names.contains(&"name"));
+        assert!(field_names.contains(&"value"));
     }
 
     #[test]
-    fn test_needs_evolution_no_new_fields() {
+    fn test_detect_new_fields_no_new_fields() {
         let table_schema = Schema::try_new(vec![
             StructField::new("id".to_string(), DataType::LONG, true),
             StructField::new("name".to_string(), DataType::STRING, true),
@@ -170,26 +210,8 @@ mod tests {
 
         let file_schema = infer_schema_from_json_sample(sample_json()).unwrap();
 
-        assert!(!needs_evolution(&table_schema, &file_schema));
-    }
-
-    #[test]
-    fn test_merge_schemas() {
-        let table_schema = Schema::try_new(vec![StructField::new(
-            "id".to_string(),
-            DataType::LONG,
-            true,
-        )])
-        .unwrap();
-
-        let file_schema = infer_schema_from_json_sample(sample_json()).unwrap();
-
-        let new_fields = merge_schemas(&table_schema, &file_schema);
-
-        assert_eq!(new_fields.len(), 2);
-        let field_names: Vec<&str> = new_fields.iter().map(|f| f.name.as_str()).collect();
-        assert!(field_names.contains(&"name"));
-        assert!(field_names.contains(&"value"));
+        let new_fields = detect_new_fields(&table_schema, &file_schema);
+        assert!(new_fields.is_none());
     }
 
     #[test]
