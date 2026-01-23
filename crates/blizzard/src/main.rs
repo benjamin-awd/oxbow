@@ -79,7 +79,7 @@ async fn main() -> std::result::Result<(), Error> {
     let mut state_initialized = !state.processed_files.is_empty();
 
     loop {
-        match poll_and_process(&config, &mut state, &mut state_initialized).await {
+        match poll_and_process(&config, &mut state, &mut state_initialized, &heartbeat).await {
             Ok(_) => {}
             Err(e) => {
                 if e.is_fatal() {
@@ -103,6 +103,7 @@ async fn poll_and_process(
     config: &Config,
     state: &mut ProcessedState,
     state_initialized: &mut bool,
+    heartbeat: &health::Heartbeat,
 ) -> Result<()> {
     let bucket_url =
         Url::parse(&format!("gs://{}", config.source_bucket)).context(UrlParseSnafu {
@@ -217,6 +218,9 @@ async fn poll_and_process(
         )
         .await?;
         total_processed += processed;
+
+        // Update heartbeat after each batch to prevent health check failures during long processing
+        heartbeat.touch();
     }
 
     // Prune old entries from state to keep it bounded

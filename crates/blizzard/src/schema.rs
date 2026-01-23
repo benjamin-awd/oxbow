@@ -47,9 +47,7 @@ fn make_field_nullable(field: &Field) -> Field {
                 .collect();
             ArrowDataType::Struct(nullable_fields.into())
         }
-        ArrowDataType::List(inner) => {
-            ArrowDataType::List(Arc::new(make_field_nullable(inner)))
-        }
+        ArrowDataType::List(inner) => ArrowDataType::List(Arc::new(make_field_nullable(inner))),
         ArrowDataType::LargeList(inner) => {
             ArrowDataType::LargeList(Arc::new(make_field_nullable(inner)))
         }
