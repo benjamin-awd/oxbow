@@ -223,3 +223,82 @@ async fn test_source_file_column_is_not_nullable() {
     assert_eq!(field.name, SOURCE_FILE_COLUMN);
     assert_eq!(field.data_type, DataType::STRING);
 }
+
+#[tokio::test]
+async fn test_create_table_with_name_stores_in_metadata() {
+    let temp_dir = TempDir::new().unwrap();
+    let (log_store, _object_store) = create_temp_stores(&temp_dir);
+
+    let table_name = "my_test_table";
+
+    let table = CreateBuilder::new()
+        .with_log_store(log_store)
+        .with_table_name(table_name)
+        .with_column("id", DataType::LONG, false, None)
+        .with_column(SOURCE_FILE_COLUMN, DataType::STRING, false, None)
+        .with_save_mode(SaveMode::Ignore)
+        .await
+        .unwrap();
+
+    // Verify the table name is stored in metadata
+    let snapshot = table.snapshot().unwrap();
+    let metadata = snapshot.metadata();
+    assert_eq!(metadata.name(), Some(table_name));
+}
+
+#[tokio::test]
+async fn test_existing_table_preserves_name_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().to_str().unwrap();
+    let table_url = Url::parse(&format!("file://{}", path)).unwrap();
+
+    // Create a table with a specific name
+    let original_name = "original_table_name";
+    {
+        let log_store = logstore_for(&table_url, StorageConfig::default()).unwrap();
+
+        let _table = CreateBuilder::new()
+            .with_log_store(log_store)
+            .with_table_name(original_name)
+            .with_column("id", DataType::LONG, false, None)
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+    }
+
+    // Reopen the table (simulating what happens when table already exists)
+    let reopened = deltalake::open_table(table_url.clone()).await.unwrap();
+
+    // Verify the original name is preserved
+    let snapshot = reopened.snapshot().unwrap();
+    let metadata = snapshot.metadata();
+    assert_eq!(metadata.name(), Some(original_name));
+}
+
+#[tokio::test]
+async fn test_open_existing_table_does_not_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().to_str().unwrap();
+    let table_url = Url::parse(&format!("file://{}", path)).unwrap();
+
+    // Create a table first
+    {
+        let log_store = logstore_for(&table_url, StorageConfig::default()).unwrap();
+
+        let _table = CreateBuilder::new()
+            .with_log_store(log_store)
+            .with_column("id", DataType::LONG, false, None)
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+    }
+
+    // Opening an existing table should succeed
+    let result = deltalake::open_table(table_url).await;
+    assert!(result.is_ok());
+
+    // Verify we can read the schema
+    let table = result.unwrap();
+    let schema = table.snapshot().unwrap().schema();
+    assert!(schema.index_of("id").is_some());
+}

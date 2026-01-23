@@ -18,9 +18,7 @@
 /// State is stored at gs://{DELTA_TABLE_URI}/_file_loader_state.json
 ///
 use blizzard::config::Config;
-use blizzard::error::{
-    DeltaTableSnafu, Error, ObjectStoreError, Result, SchemaInferenceSnafu, UrlParseSnafu,
-};
+use blizzard::error::{DeltaTableSnafu, Error, ObjectStoreError, Result, UrlParseSnafu};
 use blizzard::health;
 use blizzard::read::{
     augment_with_source_file, is_gzip_compressed, is_supported_json_file, sample_schema_from_file,
@@ -59,7 +57,7 @@ async fn main() -> std::result::Result<(), Error> {
     let config = Config::from_env();
 
     info!(
-        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}",
+        "Configuration: bucket={}, prefix={}, table={}, table_name={}, state={}, interval={}s, concurrency={}, batch_size={}, schema_evolution={}, schema_sample_bytes={}, file_timeout={}s, max_retries={}, file_listing_chunk_size={}",
         config.source_bucket,
         config.source_prefix,
         config.delta_table_uri,
@@ -71,7 +69,8 @@ async fn main() -> std::result::Result<(), Error> {
         config.schema_evolution,
         config.schema_sample_bytes,
         config.file_timeout_secs,
-        config.max_file_retries
+        config.max_file_retries,
+        config.file_listing_chunk_size
     );
 
     // Start health check server with heartbeat tracking
@@ -103,8 +102,6 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     use deltalake::logstore::{StorageConfig, logstore_for};
     use snafu::ResultExt;
 
-    const FILE_BATCH_SIZE: usize = 100;
-
     debug!(
         "Polling gs://{}/{} for new files",
         config.source_bucket, config.source_prefix
@@ -122,42 +119,23 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     let list_prefix = (!config.source_prefix.is_empty())
         .then(|| deltalake::Path::from(config.source_prefix.as_str()));
 
-    // First, collect all candidate files from the bucket
-    // We need to do this before opening the table so we have files available
-    // for schema inference if the table doesn't exist yet
-    let mut candidate_files: Vec<deltalake::ObjectMeta> = Vec::new();
-    let mut total_listed = 0usize;
-
+    // Stream listing and process in chunks to avoid loading all file metadata into memory
     let mut listing = object_store.list(list_prefix.as_ref());
-    while let Some(result) = listing.next().await {
-        let obj = result.map_err(|e| {
-            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
-        })?;
-        total_listed += 1;
 
-        let name = obj.location.as_ref();
-
-        // Skip archived files
-        if name.starts_with(ARCHIVE_PREFIX) {
-            continue;
-        }
-
-        // Collect supported JSON files that haven't permanently failed
-        if is_supported_json_file(name) && !state.is_permanently_failed(name) {
-            candidate_files.push(obj);
-        }
-    }
-
-    // If no candidate files, nothing to do
-    if candidate_files.is_empty() {
-        debug!("No candidate files to process ({} listed)", total_listed);
-        return Ok(());
-    }
+    // First, peek at the listing to get the first valid file for table creation
+    let first_file = peek_first_valid_file(&mut listing, &state).await?;
 
     // Try to open the Delta table, creating it if it doesn't exist
     let mut table = match oxbow::lock::open_table(&config.delta_table_uri).await {
         Ok(table) => table,
         Err(DeltaTableError::NotATable(_)) => {
+            let sample_file = match &first_file {
+                Some(f) => f,
+                None => {
+                    debug!("No valid files found to create table from");
+                    return Ok(());
+                }
+            };
             info!(
                 "Delta table does not exist at {}, creating from first JSON file",
                 config.delta_table_uri
@@ -165,7 +143,7 @@ async fn poll_and_process(config: &Config) -> Result<()> {
             create_table_from_json(
                 &config.delta_table_uri,
                 &object_store,
-                &candidate_files[0],
+                sample_file,
                 config,
             )
             .await?
@@ -190,33 +168,66 @@ async fn poll_and_process(config: &Config) -> Result<()> {
         );
     }
 
-    // Filter out already-processed files
-    let new_files: Vec<deltalake::ObjectMeta> = candidate_files
-        .into_iter()
-        .filter(|obj| !delta_processed_files.contains(obj.location.as_ref()))
-        .collect();
+    // Process files in chunks to bound memory usage
+    let chunk_size = config.file_listing_chunk_size;
+    let mut chunk: Vec<deltalake::ObjectMeta> = Vec::with_capacity(chunk_size);
+    let mut total_processed = 0usize;
+    let mut total_listed = 0usize;
+    let mut chunk_idx = 0usize;
 
-    if new_files.is_empty() {
-        debug!(
-            "No new files to process ({} listed, {} already processed)",
-            total_listed,
-            delta_processed_files.len()
-        );
-        return Ok(());
+    // Add the first file to the chunk if it wasn't already processed
+    if let Some(f) = first_file {
+        total_listed += 1;
+        if !delta_processed_files.contains(f.location.as_ref()) {
+            chunk.push(f);
+        }
     }
 
-    // Process files in batches
-    let mut total_processed = 0usize;
+    // Continue streaming the rest of the listing
+    while let Some(result) = listing.next().await {
+        let obj = result.map_err(|e| {
+            ObjectStoreError::from_source(e, &format!("gs://{}", config.source_bucket))
+        })?;
+        total_listed += 1;
 
-    for (batch_idx, batch) in new_files.chunks(FILE_BATCH_SIZE).enumerate() {
-        if batch_idx > 0 || batch.len() >= FILE_BATCH_SIZE {
-            info!("Processing batch {} ({} files)", batch_idx + 1, batch.len());
-        } else {
-            info!("Processing {} files", batch.len());
+        let name = obj.location.as_ref();
+
+        // Skip archived files
+        if name.starts_with(ARCHIVE_PREFIX) {
+            continue;
         }
 
-        let processed = process_file_batch(
-            batch,
+        // Collect supported JSON files that haven't permanently failed and aren't already processed
+        if is_supported_json_file(name)
+            && !state.is_permanently_failed(name)
+            && !delta_processed_files.contains(name)
+        {
+            chunk.push(obj);
+        }
+
+        // Process chunk when it reaches the configured size
+        if chunk.len() >= chunk_size {
+            let processed = process_chunk(
+                &chunk,
+                chunk_idx,
+                &object_store,
+                &arrow_schema,
+                &mut table,
+                &mut state,
+                config,
+            )
+            .await?;
+            total_processed += processed;
+            chunk.clear();
+            chunk_idx += 1;
+        }
+    }
+
+    // Process remaining files in the final chunk
+    if !chunk.is_empty() {
+        let processed = process_chunk(
+            &chunk,
+            chunk_idx,
             &object_store,
             &arrow_schema,
             &mut table,
@@ -224,7 +235,6 @@ async fn poll_and_process(config: &Config) -> Result<()> {
             config,
         )
         .await?;
-
         total_processed += processed;
     }
 
@@ -238,6 +248,74 @@ async fn poll_and_process(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Peek at the listing stream to get the first valid file for table creation.
+/// This consumes only the first matching file from the stream.
+async fn peek_first_valid_file(
+    listing: &mut futures::stream::BoxStream<
+        'static,
+        std::result::Result<deltalake::ObjectMeta, deltalake::ObjectStoreError>,
+    >,
+    state: &ProcessedState,
+) -> Result<Option<deltalake::ObjectMeta>> {
+    while let Some(result) = listing.next().await {
+        let obj = result.map_err(|e| ObjectStoreError::from_source(e, "listing"))?;
+        let name = obj.location.as_ref();
+
+        // Skip archived files
+        if name.starts_with(ARCHIVE_PREFIX) {
+            continue;
+        }
+
+        // Return first supported JSON file that hasn't permanently failed
+        if is_supported_json_file(name) && !state.is_permanently_failed(name) {
+            return Ok(Some(obj));
+        }
+    }
+    Ok(None)
+}
+
+/// Process a chunk of files, breaking them into smaller batches for Delta commits.
+async fn process_chunk(
+    chunk: &[deltalake::ObjectMeta],
+    chunk_idx: usize,
+    object_store: &Arc<dyn ObjectStore>,
+    arrow_schema: &Arc<deltalake::arrow::datatypes::Schema>,
+    table: &mut deltalake::DeltaTable,
+    state: &mut ProcessedState,
+    config: &Config,
+) -> Result<usize> {
+    const FILE_BATCH_SIZE: usize = 100;
+
+    let mut chunk_processed = 0usize;
+
+    for (batch_idx, batch) in chunk.chunks(FILE_BATCH_SIZE).enumerate() {
+        let global_batch_idx = chunk_idx * (config.file_listing_chunk_size / FILE_BATCH_SIZE) + batch_idx;
+        if global_batch_idx > 0 || batch.len() >= FILE_BATCH_SIZE {
+            info!(
+                "Processing batch {} ({} files)",
+                global_batch_idx + 1,
+                batch.len()
+            );
+        } else {
+            info!("Processing {} files", batch.len());
+        }
+
+        let processed = process_file_batch(
+            batch,
+            object_store,
+            arrow_schema,
+            table,
+            state,
+            config,
+        )
+        .await?;
+
+        chunk_processed += processed;
+    }
+
+    Ok(chunk_processed)
 }
 
 /// Create a new Delta table by inferring schema from a JSON file.
@@ -319,9 +397,9 @@ async fn process_file_batch(
     config: &Config,
 ) -> Result<usize> {
     use deltalake::kernel::StructField;
+    use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
     use snafu::ResultExt;
 
-    let mut all_batches: Vec<deltalake::arrow::array::RecordBatch> = Vec::new();
     let mut processed_paths: Vec<String> = Vec::new();
     let mut total_records: usize = 0;
     let mut new_fields: Vec<StructField> = Vec::new();
@@ -381,6 +459,11 @@ async fn process_file_batch(
         Arc::clone(arrow_schema)
     };
 
+    // Create writer upfront - batches will be written as they're parsed
+    let mut writer = RecordBatchWriter::for_table(&table)
+        .context(DeltaTableSnafu)?
+        .with_commit_properties(oxbow::default_commit_properties());
+
     let file_timeout = Duration::from_secs(config.file_timeout_secs);
     let max_retries = config.max_file_retries;
 
@@ -412,24 +495,39 @@ async fn process_file_batch(
         })
         .buffer_unordered(config.download_concurrency);
 
+    let mut has_batches = false;
+
     while let Some((file_path, result)) = stream.next().await {
         match result {
             Ok(Ok((batches, records))) => {
                 info!("Parsed {} records from {}", records, file_path);
-                // Augment each batch with the source file column for atomic state tracking
+                // Write each batch directly to the writer (streaming, no accumulation)
+                let mut file_success = true;
                 for batch in batches {
                     match augment_with_source_file(batch, &file_path) {
-                        Ok(augmented) => all_batches.push(augmented),
+                        Ok(augmented) => {
+                            if let Err(e) = writer.write(augmented).await {
+                                error!("Failed to write batch to Delta writer: {:?}", e);
+                                let write_error = Error::DeltaTable { source: e };
+                                state.record_failure(&file_path, &write_error, max_retries);
+                                file_success = false;
+                                break;
+                            }
+                            has_batches = true;
+                        }
                         Err(e) => {
                             error!("Failed to augment batch with source file: {:?}", e);
                             state.record_failure(&file_path, &e, max_retries);
-                            continue;
+                            file_success = false;
+                            break;
                         }
                     }
                 }
-                state.clear_failure(&file_path);
-                processed_paths.push(file_path);
-                total_records += records;
+                if file_success {
+                    state.clear_failure(&file_path);
+                    processed_paths.push(file_path);
+                    total_records += records;
+                }
             }
             Ok(Err(e)) => {
                 state.record_failure(&file_path, &e, max_retries);
@@ -446,15 +544,11 @@ async fn process_file_batch(
 
     let files_processed = processed_paths.len();
 
-    if !all_batches.is_empty() {
-        let batch_iter = all_batches.into_iter().map(Ok);
-
+    if has_batches {
         let updated_table = if !new_fields.is_empty() {
-            commit_with_schema_evolution(table.clone(), batch_iter, &new_fields).await?
+            commit_writer_with_schema_evolution(table.clone(), writer, &new_fields).await?
         } else {
-            oxbow::write::append_batches(table.clone(), batch_iter)
-                .await
-                .context(DeltaTableSnafu)?
+            commit_writer(table.clone(), writer).await?
         };
         *table = updated_table;
 
@@ -475,7 +569,7 @@ async fn process_file_batch(
 
         let mut archived = 0;
         for path in &processed_paths {
-            match archive_file(object_store, path, &config.source_prefix, ARCHIVE_PREFIX).await {
+            match archive_file(object_store, path, ARCHIVE_PREFIX).await {
                 Ok(()) => archived += 1,
                 Err(Error::ObjectStore {
                     source: ObjectStoreError::NotFound { .. },
@@ -500,31 +594,30 @@ async fn process_file_batch(
     Ok(files_processed)
 }
 
-async fn commit_with_schema_evolution(
+/// Commit a writer that already has data written to it (no schema evolution).
+async fn commit_writer(
     mut table: deltalake::DeltaTable,
-    batches: impl IntoIterator<
-        Item = std::result::Result<
-            deltalake::arrow::array::RecordBatch,
-            deltalake::arrow::error::ArrowError,
-        >,
-    >,
+    mut writer: deltalake::writer::record_batch::RecordBatchWriter,
+) -> Result<deltalake::DeltaTable> {
+    use deltalake::writer::DeltaWriter;
+    use snafu::ResultExt;
+
+    writer.flush_and_commit(&mut table).await.context(DeltaTableSnafu)?;
+    Ok(table)
+}
+
+/// Commit a writer that already has data written to it, with schema evolution.
+async fn commit_writer_with_schema_evolution(
+    mut table: deltalake::DeltaTable,
+    mut writer: deltalake::writer::record_batch::RecordBatchWriter,
     new_fields: &[deltalake::kernel::StructField],
 ) -> Result<deltalake::DeltaTable> {
     use deltalake::kernel::transaction::CommitBuilder;
     use deltalake::protocol::DeltaOperation;
-    use deltalake::writer::{DeltaWriter, record_batch::RecordBatchWriter};
+    use deltalake::writer::DeltaWriter;
     use snafu::ResultExt;
 
     let metadata_action = create_metadata_action(&table, new_fields)?;
-
-    let mut writer = RecordBatchWriter::for_table(&table)
-        .context(DeltaTableSnafu)?
-        .with_commit_properties(oxbow::default_commit_properties());
-
-    for batch in batches {
-        let batch = batch.context(SchemaInferenceSnafu)?;
-        writer.write(batch).await.context(DeltaTableSnafu)?;
-    }
 
     // Flush to get add actions without committing
     let add_actions = writer.flush().await.context(DeltaTableSnafu)?;
@@ -560,14 +653,9 @@ async fn commit_with_schema_evolution(
 async fn archive_file(
     object_store: &Arc<dyn ObjectStore>,
     source_path: &str,
-    source_prefix: &str,
     archive_prefix: &str,
 ) -> Result<()> {
-    let archive_path = if let Some(stripped) = source_path.strip_prefix(source_prefix) {
-        format!("{}{}", archive_prefix, stripped)
-    } else {
-        format!("{}{}", archive_prefix, source_path)
-    };
+    let archive_path = compute_archive_path(source_path, archive_prefix);
 
     let from = deltalake::Path::from(source_path);
     let to = deltalake::Path::from(archive_path.as_str());
@@ -583,4 +671,30 @@ async fn archive_file(
 
     debug!("Archived {} -> {}", source_path, archive_path);
     Ok(())
+}
+
+/// Computes the archive path for a source file.
+/// Preserves the full source path to avoid collisions between different source prefixes.
+fn compute_archive_path(source_path: &str, archive_prefix: &str) -> String {
+    format!("{}{}", archive_prefix, source_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_archive_path_preserves_full_path_structure() {
+        let source_path = "region=asia-northeast1/auth_type=public/subject=orderbooks/version=v1/2024/01/file.json";
+        let archive_prefix = "processed/";
+
+        let archive_path = compute_archive_path(source_path, archive_prefix);
+
+        // The archive path should preserve the full path structure to avoid collisions
+        assert_eq!(
+            archive_path,
+            "processed/region=asia-northeast1/auth_type=public/subject=orderbooks/version=v1/2024/01/file.json",
+            "Archive path should preserve full source path to avoid collisions between different source prefixes"
+        );
+    }
 }
